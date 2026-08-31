@@ -1,0 +1,31 @@
+Arcana Archive 輔助批次檔
+============================
+
+install.bat
+  首次安裝或 package.json 變更後安裝 npm 依賴。
+
+run.bat
+  重建後啟動 Electron 預覽。優先使用本專案自己的 Electron；若尚未下載完成，
+  會自動借用 C:\War3ModelElectron 現有的 Electron 執行檔，不會修改該專案。
+
+開發模式
+  需要熱更新時，在專案根目錄手動執行 npm run dev。
+
+rebuild.bat
+  執行 TypeScript 檢查並重建 out 目錄。
+
+pure.bat --dry-run
+  只預覽可重建內容，不刪除任何檔案。建議清理前先執行。
+
+pure.bat
+  詢問確認後清除 node_modules、out、cache 等可重建內容；不清除 lockfile，也不清除個人圖鑑。
+
+pure.bat --lockfiles
+  額外清除 package-lock.json。
+
+pure.bat --app-data
+  額外清除 %APPDATA%\ArcanaArchive 內的 catalog.sqlite 與卡圖媒體分片。
+  這會刪除已下載卡圖和本機資料，且預設仍會詢問確認。
+
+pure.bat --yes
+  跳過確認，適合自動化。若搭配 --app-data 請特別小心。
