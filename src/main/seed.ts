@@ -4,7 +4,7 @@ type SeedInput = Omit<
   CatalogCard,
   'konamiId' | 'rank' | 'linkRating' | 'linkArrows' | 'spellTrapIcon' |
   'pendulumScaleLeft' | 'pendulumScaleRight' | 'pendulumText' | 'effectTags' |
-  'relations' | 'compatibility' | 'artworks' | 'ruleTexts'
+  'relations' | 'compatibility' | 'artworks' | 'ruleTexts' | 'isUnpopular'
 > & Partial<Pick<
   CatalogCard,
   'konamiId' | 'rank' | 'linkRating' | 'linkArrows' | 'spellTrapIcon' |
@@ -41,6 +41,7 @@ const makeCard = (input: SeedInput): CatalogCard => {
     pendulumScaleLeft: input.pendulumScaleLeft ?? null,
     pendulumScaleRight: input.pendulumScaleRight ?? null,
     pendulumText: input.pendulumText ?? null,
+    isUnpopular: false,
     effectTags: input.effectTags ?? [category],
     relations: input.relations ?? [],
     compatibility: [

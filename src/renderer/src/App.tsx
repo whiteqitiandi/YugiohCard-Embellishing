@@ -1,5 +1,22 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { CatalogCard, CatalogStats } from '../../shared/catalog'
+import type {
+  AppView,
+  CatalogCard,
+  CatalogCoverage,
+  CatalogSourcePolicy,
+  CatalogUpdateMode,
+  CatalogStats,
+  CatalogUpdateRequest,
+  CatalogUpdateResult,
+  ReleaseRegion
+} from '../../shared/catalog'
+import {
+  countFilterConditions,
+  createEmptyFilterCriteria,
+  matchesCardFilter,
+  matchesCardTextQuery,
+  type CardFilterCriteria
+} from '../../shared/filters'
 import { seedCards } from '../../main/seed'
 import {
   CardPreview,
@@ -11,8 +28,6 @@ import {
   type SurfaceScope
 } from './CardPreview'
 
-type AppView = 'catalog' | 'studio' | 'creator' | 'deck'
-
 const defaultFinish: FinishConfig = {
   surface: 'aurora',
   scope: 'whole',
@@ -21,15 +36,9 @@ const defaultFinish: FinishConfig = {
   stamp: false
 }
 
-const navItems: { id: AppView; letter: string; title: string; subtitle: string }[] = [
-  { id: 'catalog', letter: 'A', title: '卡片圖鑑', subtitle: '查詢・版本・關聯' },
-  { id: 'studio', letter: 'B', title: '藝術加工', subtitle: 'Chronicle 實驗室' },
-  { id: 'creator', letter: 'C', title: '卡片創作', subtitle: '版面與文字' },
-  { id: 'deck', letter: 'D', title: '牌組工房', subtitle: '編組與測試' }
-]
-
 const viewTitles: Record<AppView, string> = {
   catalog: '卡片圖鑑',
+  updates: '資料更新中心',
   studio: 'Chronicle 藝術加工室',
   creator: '卡片創作',
   deck: '牌組工房'
@@ -53,13 +62,17 @@ export function App(): React.JSX.Element {
   const [stats, setStats] = useState<CatalogStats | null>(null)
   const [selectedId, setSelectedId] = useState('')
   const [query, setQuery] = useState('')
-  const [kind, setKind] = useState('all')
-  const [effectTag, setEffectTag] = useState('全部')
+  const [advancedFilter, setAdvancedFilter] = useState<CardFilterCriteria>(createEmptyFilterCriteria)
   const [artworkId, setArtworkId] = useState('')
   const [ruleset, setRuleset] = useState('ocg-master')
   const [finish, setFinish] = useState<FinishConfig>(defaultFinish)
   const [textMode, setTextMode] = useState<CardTextMode>('fit')
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [updateBusy, setUpdateBusy] = useState(false)
+  const [updateNotice, setUpdateNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null)
+  const [sourcePolicies, setSourcePolicies] = useState<CatalogSourcePolicy[]>([])
+  const [popularityBusyId, setPopularityBusyId] = useState<string | null>(null)
+  const [popularityNotice, setPopularityNotice] = useState<{ cardId: string; tone: 'success' | 'error'; text: string } | null>(null)
 
   useEffect(() => {
     const catalogApi = window.arcana?.catalog
@@ -70,7 +83,11 @@ export function App(): React.JSX.Element {
           cards: seedCards.length,
           artworks: seedCards.reduce((sum, card) => sum + card.artworks.length, 0),
           ruleVariants: seedCards.reduce((sum, card) => sum + card.ruleTexts.length, 0),
-          lastSeededAt: 'browser-preview'
+          lastSeededAt: 'browser-preview',
+          importedCards: 0,
+          lastUpdatedAt: null,
+          lastUpdateLabel: null,
+          coverage: [emptyCoverage('ocg'), emptyCoverage('tcg')]
         })
     Promise.all([cardPromise, statsPromise])
       .then(([loadedCards, loadedStats]) => {
@@ -81,6 +98,41 @@ export function App(): React.JSX.Element {
       .catch((error: unknown) => {
         setLoadError(error instanceof Error ? error.message : '無法載入本機圖鑑資料庫。')
       })
+    if (catalogApi) void catalogApi.updatePolicies().then(setSourcePolicies).catch(() => undefined)
+  }, [])
+
+  useEffect(() => {
+    const cleanup: (() => void)[] = []
+    const commands = window.arcana?.commands
+    const filters = window.arcana?.filters
+    if (commands) {
+      cleanup.push(commands.onNavigate(setView))
+      cleanup.push(commands.onFocusSearch(() => {
+        setView('catalog')
+        requestAnimationFrame(() => document.querySelector<HTMLInputElement>('[data-card-search]')?.focus())
+      }))
+      cleanup.push(commands.onClearFilters(() => {
+        setQuery('')
+        setAdvancedFilter(createEmptyFilterCriteria())
+      }))
+    }
+    if (filters) {
+      cleanup.push(filters.onApplied(setAdvancedFilter))
+      void filters.getDraft().then(setAdvancedFilter).catch(() => undefined)
+    }
+
+    const handleShortcut = (event: KeyboardEvent): void => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === 'k') {
+        event.preventDefault()
+        setView('catalog')
+        requestAnimationFrame(() => document.querySelector<HTMLInputElement>('[data-card-search]')?.focus())
+      }
+    }
+    window.addEventListener('keydown', handleShortcut)
+    return () => {
+      cleanup.forEach((dispose) => dispose())
+      window.removeEventListener('keydown', handleShortcut)
+    }
   }, [])
 
   const selectedCard = cards.find((card) => card.id === selectedId) ?? cards[0]
@@ -91,40 +143,82 @@ export function App(): React.JSX.Element {
     setRuleset(selectedCard.ruleTexts[0]?.ruleset ?? 'ocg-master')
   }, [selectedCard?.id])
 
-  const allEffectTags = useMemo(
-    () => Array.from(new Set(cards.flatMap((card) => card.effectTags))).sort((a, b) => a.localeCompare(b, 'zh-Hant')),
-    [cards]
-  )
-
   const filteredCards = useMemo(() => {
-    const normalized = query.trim().toLocaleLowerCase('zh-Hant')
-    return cards.filter((card) => {
-      const matchesKind = kind === 'all' || card.kind === kind
-      const matchesTag = effectTag === '全部' || card.effectTags.includes(effectTag)
-      const haystack = [
-        card.nameZh,
-        card.nameJa,
-        card.nameEn,
-        card.passcode,
-        card.attribute,
-        card.race,
-        card.typeLine,
-        ...card.effectTags,
-        ...card.relations,
-        ...card.compatibility.map((trait) => trait.label),
-        ...card.ruleTexts.map((variant) => variant.textZh)
-      ]
-        .join(' ')
-        .toLocaleLowerCase('zh-Hant')
-      return matchesKind && matchesTag && (!normalized || haystack.includes(normalized))
-    })
-  }, [cards, effectTag, kind, query])
+    return cards.filter((card) => matchesCardTextQuery(card, query) && matchesCardFilter(card, advancedFilter))
+  }, [advancedFilter, cards, query])
+
+  useEffect(() => {
+    if (filteredCards.length > 0 && !filteredCards.some((card) => card.id === selectedId)) {
+      setSelectedId(filteredCards[0].id)
+    }
+  }, [filteredCards, selectedId])
 
   const activeRuleText =
     selectedCard?.ruleTexts.find((variant) => variant.ruleset === ruleset) ?? selectedCard?.ruleTexts[0]
 
   const openStudio = (): void => {
     setView('studio')
+  }
+
+  const openAdvancedFilters = (): void => {
+    void window.arcana?.filters.open(advancedFilter)
+  }
+
+  const clearFilters = (): void => {
+    const empty = createEmptyFilterCriteria()
+    setQuery('')
+    setAdvancedFilter(empty)
+    void window.arcana?.filters.apply(empty)
+  }
+
+  const toggleUnpopular = async (card: CatalogCard): Promise<void> => {
+    const nextValue = !card.isUnpopular
+    const catalogApi = window.arcana?.catalog
+    setPopularityBusyId(card.id)
+    setPopularityNotice(null)
+    try {
+      if (catalogApi) {
+        const changed = await catalogApi.setUnpopular(card.id, nextValue)
+        if (!changed) throw new Error('找不到要標記的卡片。')
+      }
+      setCards((current) => current.map((item) => item.id === card.id ? { ...item, isUnpopular: nextValue } : item))
+      setPopularityNotice({ cardId: card.id, tone: 'success', text: nextValue ? '已標記為冷門卡片。' : '已移除冷門卡片標記。' })
+    } catch (error: unknown) {
+      setPopularityNotice({
+        cardId: card.id,
+        tone: 'error',
+        text: error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+':\s*/, '') : '無法儲存冷門卡片標記。'
+      })
+    } finally {
+      setPopularityBusyId(null)
+    }
+  }
+
+  const runCatalogUpdate = async (request: CatalogUpdateRequest): Promise<void> => {
+    const catalogApi = window.arcana?.catalog
+    if (!catalogApi) {
+      setUpdateNotice({ tone: 'error', text: '瀏覽器預覽模式無法寫入本機資料庫，請由 Electron 應用程式執行更新。' })
+      return
+    }
+    setUpdateBusy(true)
+    setUpdateNotice({
+      tone: 'info',
+      text: `正在讀取 ${request.region.toUpperCase()} ${request.year} 年 ${request.month} 月的發行資料…`
+    })
+    try {
+      const result = await catalogApi.runUpdate(request)
+      const [loadedCards, loadedStats] = await Promise.all([catalogApi.listCards(), catalogApi.stats()])
+      setCards(loadedCards)
+      setStats(loadedStats)
+      setSelectedId((current) => loadedCards.some((card) => card.id === current) ? current : loadedCards[0]?.id ?? '')
+      setUpdateNotice({ tone: 'success', text: describeUpdateResult(result) })
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+':\s*/, '') : '更新失敗，本機資料未變更。'
+      setUpdateNotice({ tone: 'error', text: message })
+      void catalogApi.stats().then(setStats).catch(() => undefined)
+    } finally {
+      setUpdateBusy(false)
+    }
   }
 
   if (loadError) {
@@ -157,9 +251,12 @@ export function App(): React.JSX.Element {
 
         <div className="data-status">
           <div><span className="status-dot" /> 本機資料層</div>
-          <strong>{stats?.cards ?? '—'} 張示範卡・{stats?.artworks ?? '—'} 幅卡圖</strong>
-          <small>文字庫與媒體分片已啟用</small>
+          <strong>{stats?.cards ?? '—'} 張卡片・{stats?.artworks ?? '—'} 幅插圖</strong>
+          <small>{coverageSummary(stats?.coverage)}</small>
         </div>
+        <button type="button" className={`update-center-nav ${view === 'updates' ? 'is-active' : ''}`} onClick={() => setView('updates')}>
+          <Glyph>⇩</Glyph><span><strong>資料更新中心</strong><small>中文來源・續傳進度</small></span>
+        </button>
       </aside>
 
       <main className="workspace">
@@ -168,24 +265,9 @@ export function App(): React.JSX.Element {
             <span className="eyebrow">PERSONAL DUEL ARCHIVE</span>
             <h1>{viewTitles[view]}</h1>
           </div>
-          <nav className="feature-toolbar" aria-label="A B C D 功能區切換">
-            {navItems.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                className={view === item.id ? 'is-active' : ''}
-                onClick={() => setView(item.id)}
-                aria-current={view === item.id ? 'page' : undefined}
-                title={item.subtitle}
-              >
-                <span>{item.letter}</span>
-                <strong>{item.title}</strong>
-              </button>
-            ))}
-          </nav>
           <div className="topbar-actions">
+            <span className="menu-hint">功能請使用上方選單</span>
             <span className="prototype-pill">PROTOTYPE 0.1</span>
-            <button type="button" className="icon-button" aria-label="設定">⋮</button>
           </div>
         </header>
 
@@ -194,21 +276,31 @@ export function App(): React.JSX.Element {
             cards={filteredCards}
             selectedCard={selectedCard}
             query={query}
-            kind={kind}
-            effectTag={effectTag}
-            allEffectTags={allEffectTags}
+            filterCount={countFilterConditions(advancedFilter)}
             artworkId={artworkId}
             ruleset={ruleset}
             activeRuleText={activeRuleText?.textZh ?? ''}
             textMode={textMode}
             onQuery={setQuery}
-            onKind={setKind}
-            onEffectTag={setEffectTag}
+            onOpenAdvancedFilters={openAdvancedFilters}
+            onClearFilters={clearFilters}
             onSelect={setSelectedId}
             onArtwork={setArtworkId}
             onRuleset={setRuleset}
             onTextMode={setTextMode}
             onOpenStudio={openStudio}
+            onToggleUnpopular={(card) => { void toggleUnpopular(card) }}
+            popularityBusyId={popularityBusyId}
+            popularityNotice={popularityNotice}
+          />
+        ) : view === 'updates' ? (
+          <UpdateCenterView
+            stats={stats}
+            policies={sourcePolicies}
+            busy={updateBusy}
+            notice={updateNotice}
+            onUpdate={runCatalogUpdate}
+            onCatalog={() => setView('catalog')}
           />
         ) : view === 'studio' ? (
           selectedCard && (
@@ -237,21 +329,22 @@ interface CatalogViewProps {
   cards: CatalogCard[]
   selectedCard?: CatalogCard
   query: string
-  kind: string
-  effectTag: string
-  allEffectTags: string[]
+  filterCount: number
   artworkId: string
   ruleset: string
   activeRuleText: string
   textMode: CardTextMode
   onQuery: (value: string) => void
-  onKind: (value: string) => void
-  onEffectTag: (value: string) => void
+  onOpenAdvancedFilters: () => void
+  onClearFilters: () => void
   onSelect: (value: string) => void
   onArtwork: (value: string) => void
   onRuleset: (value: string) => void
   onTextMode: (value: CardTextMode) => void
   onOpenStudio: () => void
+  onToggleUnpopular: (card: CatalogCard) => void
+  popularityBusyId: string | null
+  popularityNotice: { cardId: string; tone: 'success' | 'error'; text: string } | null
 }
 
 function CatalogView(props: CatalogViewProps): React.JSX.Element {
@@ -262,35 +355,22 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
         <div className="search-field">
           <Glyph>⌕</Glyph>
           <input
+            data-card-search
             value={props.query}
             onChange={(event) => props.onQuery(event.target.value)}
-            placeholder="搜尋卡名、效果、系列、種族或密碼…"
+            placeholder="搜尋卡名、效果、系列、種族或密碼；密碼可用 * 與 ?…"
             aria-label="搜尋卡片"
           />
           <kbd>Ctrl K</kbd>
         </div>
         <div className="filter-row">
-          <label>
-            <span>卡片種類</span>
-            <select value={props.kind} onChange={(event) => props.onKind(event.target.value)}>
-              <option value="all">全部卡片</option>
-              <option value="monster">怪獸卡</option>
-              <option value="spell">魔法卡</option>
-              <option value="trap">陷阱卡</option>
-            </select>
-          </label>
-          <label>
-            <span>效果標籤</span>
-            <select value={props.effectTag} onChange={(event) => props.onEffectTag(event.target.value)}>
-              <option value="全部">全部效果</option>
-              {props.allEffectTags.map((tag) => <option key={tag}>{tag}</option>)}
-            </select>
-          </label>
-          <button type="button" className="filter-reset" onClick={() => {
-            props.onQuery('')
-            props.onKind('all')
-            props.onEffectTag('全部')
-          }}>清除篩選</button>
+          <button type="button" className="advanced-filter-button" onClick={props.onOpenAdvancedFilters}>
+            <Glyph>⌘</Glyph>
+            進階篩選條件…
+            {props.filterCount > 0 && <span>{props.filterCount}</span>}
+          </button>
+          <span className="password-hint">密碼萬用字元：<code>*3</code> 尾號為 3，<code>12?4*</code> 的 ? 代表單一數字</span>
+          <button type="button" className="filter-reset" onClick={props.onClearFilters}>清除篩選</button>
           <span className="result-count">找到 <strong>{props.cards.length}</strong> 張</span>
         </div>
       </section>
@@ -310,7 +390,7 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
                 <button
                   type="button"
                   key={card.id}
-                  className={`catalog-card ${selectedCard?.id === card.id ? 'is-selected' : ''}`}
+                  className={`catalog-card ${selectedCard?.id === card.id ? 'is-selected' : ''} ${card.isUnpopular ? 'is-unpopular' : ''}`}
                   onClick={() => props.onSelect(card.id)}
                   style={{ '--card-accent': card.accent } as React.CSSProperties}
                 >
@@ -329,8 +409,8 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
                     </span>
                   </div>
                   <div className="catalog-card-copy">
-                    <strong>{card.nameZh}</strong>
-                    <small>{card.nameJa}</small>
+                    <strong>{card.nameZh}{card.isUnpopular && <span className="unpopular-card-badge">冷門</span>}</strong>
+                    <small>{card.nameJa || '—（未於 OCG 發行）'}</small>
                     <div className="mini-tags">
                       {card.effectTags.slice(0, 2).map((tag) => <span key={tag}>{tag}</span>)}
                     </div>
@@ -386,10 +466,33 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
         {selectedCard && (
           <aside className="card-inspector">
             <div className="inspector-title">
-              <span>{selectedCard.nameJa}</span>
+              <span>{selectedCard.nameJa || '—（未於 OCG 發行）'}</span>
               <h2>{selectedCard.nameZh}</h2>
-              <p>{selectedCard.nameEn}</p>
+              <p>{selectedCard.nameEn || '—（未於 TCG 發行）'}</p>
             </div>
+            {selectedCard.sourceName && (
+              <div className="card-source-note">
+                <span>結構／發行</span>
+                <a href={selectedCard.sourceUrl ?? 'https://ygoprodeck.com/api-guide/'} target="_blank" rel="noreferrer">
+                  {selectedCard.sourceName} ↗
+                </a>
+                <span>語系資料</span>
+                {selectedCard.localizationSourceUrl ? (
+                  <a href={selectedCard.localizationSourceUrl} target="_blank" rel="noreferrer">
+                    {selectedCard.localizationSourceName ?? '中文來源'} ↗
+                  </a>
+                ) : <strong>{selectedCard.localizationSourceName ?? '尚無中文來源'}</strong>}
+                <small>
+                  {selectedCard.ocgReleaseDate ? `OCG ${selectedCard.ocgReleaseDate}` : ''}
+                  {selectedCard.ocgReleaseDate && selectedCard.tcgReleaseDate ? '・' : ''}
+                  {selectedCard.tcgReleaseDate ? `TCG ${selectedCard.tcgReleaseDate}` : ''}
+                  {!selectedCard.ocgReleaseDate && !selectedCard.tcgReleaseDate ? (selectedCard.releaseRegion?.toUpperCase() ?? 'OCG/TCG') : ''}
+                  {`・語系 ${(selectedCard.supportedLanguages ?? ['zh', 'en', 'ja']).map((language) => language === 'zh' ? '中' : language === 'en' ? '英' : '日').join('／')}`}
+                  {`（必要 ${(selectedCard.requiredLanguages ?? ['zh', 'en', 'ja']).map((language) => language === 'zh' ? '中' : language === 'en' ? '英' : '日').join('／')}）`}
+                  {selectedCard.localizationStatus === 'zh-tw-converted' ? '・中文來源經 OpenCC 轉為台灣正體' : '・保留人工整理文字'}
+                </small>
+              </div>
+            )}
             <div className="stat-strip">
               <span><small>屬性</small><strong>{selectedCard.attribute}</strong></span>
               <span><small>種族</small><strong>{selectedCard.race}</strong></span>
@@ -426,11 +529,201 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
               {selectedCard.relations.map((tag) => <span className="relation-tag" key={tag}>#{tag}</span>)}
             </div>
 
+            <button
+              type="button"
+              className={`popularity-toggle ${selectedCard.isUnpopular ? 'is-active' : ''}`}
+              disabled={props.popularityBusyId === selectedCard.id}
+              onClick={() => props.onToggleUnpopular(selectedCard)}
+            >
+              <Glyph>{selectedCard.isUnpopular ? '◉' : '○'}</Glyph>
+              <span>
+                <strong>{selectedCard.isUnpopular ? '已標記為冷門卡片' : '標記為冷門卡片'}</strong>
+                <small>{selectedCard.isUnpopular ? '可在進階篩選取消隱藏，或按此移除標記' : '只影響本機顯示與篩選，不修改來源資料'}</small>
+              </span>
+            </button>
+            {props.popularityNotice?.cardId === selectedCard.id && (
+              <p className={`popularity-notice tone-${props.popularityNotice.tone}`} role="status">{props.popularityNotice.text}</p>
+            )}
+
             <button type="button" className="primary-action" onClick={props.onOpenStudio}>
               <span>進入藝術加工室</span><Glyph>↗</Glyph>
             </button>
           </aside>
         )}
+      </div>
+    </div>
+  )
+}
+
+const describeUpdateResult = (result: CatalogUpdateResult): string => {
+  const scope = `${result.region.toUpperCase()} ${result.year} 年 ${result.month} 月`
+  const counts = `讀取 ${result.fetched} 張、語系完整 ${result.localized} 張，新增 ${result.inserted} 張、更新 ${result.updated} 張`
+  const languageGaps = [
+    result.languageGaps.zh > 0 ? `中文 ${result.languageGaps.zh}` : '',
+    result.languageGaps.en > 0 ? `英文 ${result.languageGaps.en}` : '',
+    result.languageGaps.ja > 0 ? `日文 ${result.languageGaps.ja}` : ''
+  ].filter(Boolean).join('、')
+  if (result.mode === 'month') {
+    const suffix = result.missingRequiredLanguages > 0
+      ? `；${result.missingRequiredLanguages} 張因必要語系不完整而未匯入（${languageGaps}）`
+      : ''
+    return `${scope} 單月更新完成：${counts}${suffix}。`
+  }
+  const coverage = result.releaseCompleteThrough
+    ? `資料已完整涵蓋至發行日 ${result.releaseCompleteThrough}`
+    : '尚未完成第一個發行月份'
+  if (result.limitReached) {
+    const stopReason = result.stoppedBy === 'metadata-request-limit'
+      ? '已達 YGOPRODeck 本次請求上限'
+      : result.stoppedBy === 'chinese-card-limit'
+        ? '已達百鴿中文來源本次流量上限'
+        : result.stoppedBy === 'waiting-language'
+          ? `遇到必要語系不完整的卡片${result.missingRequiredLanguages > 0 ? `（${languageGaps}）` : ''}`
+          : '已依來源規則停止'
+    return `${counts}；${stopReason}。${coverage}${result.resumeMonth ? `，下次由 ${result.resumeMonth} 接續` : ''}。`
+  }
+  return `${counts}；${coverage}。`
+}
+
+const emptyCoverage = (region: ReleaseRegion): CatalogCoverage => ({
+  region,
+  completeThrough: null,
+  resumeMonth: null,
+  resumeOffset: 0,
+  targetMonth: null,
+  status: 'not-started',
+  note: null
+})
+
+const coverageSummary = (coverage?: CatalogCoverage[]): string => {
+  const ocg = coverage?.find((item) => item.region === 'ocg')
+  const tcg = coverage?.find((item) => item.region === 'tcg')
+  if (!ocg?.completeThrough && !tcg?.completeThrough) return '尚未建立連續發行時間涵蓋範圍'
+  return `OCG ${ocg?.completeThrough ?? '未開始'}・TCG ${tcg?.completeThrough ?? '未開始'}`
+}
+
+const coverageStatusText = (coverage: CatalogCoverage): string => {
+  if (coverage.status === 'complete') return '已達指定目標'
+  if (coverage.status === 'source-limit') return '已到本次流量上限'
+  if (coverage.status === 'waiting-language') return '等待必要語系'
+  return '尚未開始'
+}
+
+function UpdateCenterView({
+  stats,
+  policies,
+  busy,
+  notice,
+  onUpdate,
+  onCatalog
+}: {
+  stats: CatalogStats | null
+  policies: CatalogSourcePolicy[]
+  busy: boolean
+  notice: { tone: 'success' | 'error' | 'info'; text: string } | null
+  onUpdate: (request: CatalogUpdateRequest) => Promise<void>
+  onCatalog: () => void
+}): React.JSX.Element {
+  const today = new Date()
+  const [year, setYear] = useState(today.getFullYear())
+  const [month, setMonth] = useState(today.getMonth() + 1)
+  const [region, setRegion] = useState<ReleaseRegion>('ocg')
+  const [mode, setMode] = useState<CatalogUpdateMode>('month')
+  const years = Array.from({ length: today.getFullYear() + 2 - 1999 }, (_, index) => today.getFullYear() + 1 - index)
+  const coverage = stats?.coverage ?? [emptyCoverage('ocg'), emptyCoverage('tcg')]
+  const activeCoverage = coverage.find((item) => item.region === region) ?? emptyCoverage(region)
+
+  return (
+    <div className="update-center-view">
+      <section className="update-center-hero">
+        <div>
+          <button type="button" className="back-button" onClick={onCatalog}>← 返回卡片圖鑑</button>
+          <span className="eyebrow">RELEASE DATA COVERAGE</span>
+          <h2>可續傳的多語卡片資料更新</h2>
+          <p>中文、英文、日文名稱會依 OCG／TCG 發行區域檢查完整性：跨區發行必須三語齊全，區域限定卡只要求中文及該區語系；程式不會把執行更新的時間誤當成卡片發行涵蓋時間。</p>
+        </div>
+        <div className="coverage-grid">
+          {coverage.map((item) => (
+            <article key={item.region} className={item.region === region ? 'is-active' : ''}>
+              <span>{item.region.toUpperCase()}</span>
+              <strong>{item.completeThrough ?? '尚未開始'}</strong>
+              <small>完整涵蓋至此發行日</small>
+              <em>{coverageStatusText(item)}</em>
+              {item.resumeMonth && <p>續傳：{item.resumeMonth}{item.resumeOffset ? `，月內第 ${item.resumeOffset + 1} 張` : ''}</p>}
+              {item.note && <p className="coverage-note">{item.note}</p>}
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <div className="update-center-layout">
+        <section className="update-config-card">
+          <span className="eyebrow">UPDATE SCOPE</span>
+          <h3>選擇更新範圍</h3>
+          <div className="update-mode-switch" role="group" aria-label="更新方式">
+            <button type="button" className={mode === 'month' ? 'is-active' : ''} onClick={() => setMode('month')}>指定單一月份</button>
+            <button type="button" className={mode === 'through' ? 'is-active' : ''} onClick={() => setMode('through')}>截至指定年月的全部卡片</button>
+          </div>
+          <p className="update-mode-note">
+            {mode === 'month'
+              ? '只更新所選發行月份，不改變「已完整涵蓋至」的連續進度。'
+              : `從 ${activeCoverage.resumeMonth ?? (activeCoverage.completeThrough ? '下一個未完成月份' : region === 'ocg' ? '1999-01' : '2002-01')} 接續，直到目標月份或本次來源上限。`}
+          </p>
+          <form
+            className="update-center-form"
+            onSubmit={(event) => {
+              event.preventDefault()
+              void onUpdate({ mode, year, month, region })
+            }}
+          >
+            <label>
+              <span>發行地區</span>
+              <select value={region} disabled={busy} onChange={(event) => setRegion(event.target.value as ReleaseRegion)}>
+                <option value="ocg">OCG（日本發行日）</option>
+                <option value="tcg">TCG（英語圈發行日）</option>
+              </select>
+            </label>
+            <label>
+              <span>{mode === 'through' ? '截止年份' : '發行年份'}</span>
+              <select value={year} disabled={busy} onChange={(event) => setYear(Number(event.target.value))}>
+                {years.map((value) => <option key={value} value={value}>{value} 年</option>)}
+              </select>
+            </label>
+            <label>
+              <span>{mode === 'through' ? '截止月份（含）' : '發行月份'}</span>
+              <select value={month} disabled={busy} onChange={(event) => setMonth(Number(event.target.value))}>
+                {Array.from({ length: 12 }, (_, index) => index + 1).map((value) => (
+                  <option key={value} value={value}>{value} 月</option>
+                ))}
+              </select>
+            </label>
+            <button type="submit" disabled={busy}>
+              {busy ? '正在依來源規則更新…' : mode === 'through' ? `更新至 ${year} 年 ${month} 月` : `更新 ${year} 年 ${month} 月`}
+            </button>
+          </form>
+          {notice && <div className={`update-notice tone-${notice.tone}`} role={notice.tone === 'error' ? 'alert' : 'status'}>{notice.text}</div>}
+        </section>
+
+        <aside className="source-policy-panel">
+          <span className="eyebrow">SOURCE-SPECIFIC LIMITS</span>
+          <h3>來源與獨立流量政策</h3>
+          <div className="source-policy-list">
+            {policies.map((policy) => (
+              <article key={policy.id}>
+                <header><strong>{policy.name}</strong><span>{policy.language}</span></header>
+                <p>{policy.role}</p>
+                <dl>
+                  <div><dt>批次</dt><dd>{policy.batchSize} 張</dd></div>
+                  <div><dt>間隔</dt><dd>{policy.requestIntervalMs / 1000} 秒</dd></div>
+                  <div><dt>單次請求</dt><dd>{policy.maxRequestsPerRun} 次</dd></div>
+                  <div><dt>單次卡片</dt><dd>{policy.maxCardsPerRun} 張</dd></div>
+                </dl>
+                <a href={policy.guideUrl} target="_blank" rel="noreferrer">查看來源規格 ↗</a>
+              </article>
+            ))}
+          </div>
+          <p className="source-policy-foot">卡圖不在更新期間批次下載；仍只在查看時抓取一次並存入本機媒體分片。</p>
+        </aside>
       </div>
     </div>
   )
@@ -578,8 +871,8 @@ function ReservedView({ view, onCatalog }: { view: 'creator' | 'deck'; onCatalog
       <span className="reserved-letter">{isCreator ? 'C' : 'D'}</span>
       <span className="eyebrow">FUNCTION AREA</span>
       <h2>{isCreator ? '卡片創作' : '牌組工房'}</h2>
-      <p>{isCreator ? '此功能區已可由工具列切換；編輯器將在後續階段接入。' : '此功能區已可由工具列切換；牌組編組與測試流程將在後續階段接入。'}</p>
-      <button type="button" className="back-button" onClick={onCatalog}>返回 A・卡片圖鑑</button>
+      <p>{isCreator ? '此功能區已可由「功能」選單切換；編輯器將在後續階段接入。' : '此功能區已可由「功能」選單切換；牌組編組與測試流程將在後續階段接入。'}</p>
+      <button type="button" className="back-button" onClick={onCatalog}>返回卡片圖鑑</button>
     </section>
   )
 }
