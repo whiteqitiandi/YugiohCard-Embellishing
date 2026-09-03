@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type {
   AppView,
   CatalogCard,
@@ -347,21 +347,290 @@ interface CatalogViewProps {
   popularityNotice: { cardId: string; tone: 'success' | 'error'; text: string } | null
 }
 
+type CatalogLayout = 'focus' | 'directory'
+type CatalogSortKey = 'catalog' | 'name' | 'atk' | 'def' | 'level' | 'release' | 'type'
+type CatalogSortDirection = 'asc' | 'desc'
+
+const directoryPageSize = 72
+const thumbnailMemory = new Map<string, string | null>()
+
+const catalogSortOptions: Array<{ value: CatalogSortKey; label: string }> = [
+  { value: 'catalog', label: '圖鑑順序' },
+  { value: 'name', label: '卡片名稱' },
+  { value: 'atk', label: '攻擊力 ATK' },
+  { value: 'def', label: '守備力 DEF' },
+  { value: 'level', label: '等級／階級／LINK' },
+  { value: 'release', label: '首次發行日期' },
+  { value: 'type', label: '卡片種類' }
+]
+
+const catalogSortLabel = (sortKey: CatalogSortKey): string =>
+  catalogSortOptions.find((option) => option.value === sortKey)?.label ?? '圖鑑順序'
+
+const cardProgression = (card: CatalogCard): number | null => card.level ?? card.rank ?? card.linkRating
+
+const cardReleaseDate = (card: CatalogCard): string | null => {
+  const dates = [card.releaseDate, card.ocgReleaseDate, card.tcgReleaseDate].filter((date): date is string => Boolean(date))
+  return dates.sort()[0] ?? null
+}
+
+const cardTypeSortValue = (card: CatalogCard): string =>
+  `${card.kind === 'monster' ? '0' : card.kind === 'spell' ? '1' : '2'}-${card.frame}-${card.typeLine}`
+
+const compareCatalogValues = (
+  first: string | number | null,
+  second: string | number | null,
+  direction: CatalogSortDirection
+): number => {
+  if (first == null && second == null) return 0
+  if (first == null) return 1
+  if (second == null) return -1
+  const comparison = typeof first === 'number' && typeof second === 'number'
+    ? first - second
+    : String(first).localeCompare(String(second), 'zh-Hant', { numeric: true, sensitivity: 'base' })
+  return direction === 'asc' ? comparison : -comparison
+}
+
+const sortCatalogCards = (
+  cards: CatalogCard[],
+  sortKey: CatalogSortKey,
+  direction: CatalogSortDirection
+): CatalogCard[] => {
+  if (sortKey === 'catalog') return direction === 'asc' ? [...cards] : [...cards].reverse()
+  const valueFor = (card: CatalogCard): string | number | null => {
+    if (sortKey === 'name') return card.nameZh || card.nameJa || card.nameEn
+    if (sortKey === 'atk') return card.atk
+    if (sortKey === 'def') return card.def
+    if (sortKey === 'level') return cardProgression(card)
+    if (sortKey === 'release') return cardReleaseDate(card)
+    return cardTypeSortValue(card)
+  }
+  return cards
+    .map((card, index) => ({ card, index }))
+    .sort((first, second) => {
+      const comparison = compareCatalogValues(valueFor(first.card), valueFor(second.card), direction)
+      if (comparison !== 0) return comparison
+      return first.index - second.index
+    })
+    .map(({ card }) => card)
+}
+
+const cardProgressionLabel = (card: CatalogCard): string => {
+  if (card.rank != null) return `RANK ${card.rank}`
+  if (card.linkRating != null) return `LINK ${card.linkRating}`
+  if (card.level != null) return `LV ${card.level}`
+  return card.typeLine
+}
+
+function DirectoryCardArtwork({ card }: { card: CatalogCard }): React.JSX.Element {
+  const artwork = card.artworks[0]
+  const remembered = artwork ? thumbnailMemory.get(artwork.id) : null
+  const [artUrl, setArtUrl] = useState<string | null>(remembered ?? null)
+  const [visible, setVisible] = useState(false)
+  const hostRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const host = hostRef.current
+    if (!host || visible) return
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry?.isIntersecting) return
+      setVisible(true)
+      observer.disconnect()
+    }, { rootMargin: '260px' })
+    observer.observe(host)
+    return () => observer.disconnect()
+  }, [visible])
+
+  useEffect(() => {
+    if (!visible || !artwork) return
+    const cached = thumbnailMemory.get(artwork.id)
+    if (cached !== undefined) {
+      setArtUrl(cached)
+      return
+    }
+    let active = true
+    const resolver = window.arcana?.catalog.resolveArtwork ?? (() => Promise.resolve(artwork.sourceUrl))
+    void resolver(artwork.id).then((resolved) => {
+      thumbnailMemory.set(artwork.id, resolved)
+      if (active) setArtUrl(resolved)
+    }).catch(() => {
+      thumbnailMemory.set(artwork.id, null)
+      if (active) setArtUrl(null)
+    })
+    return () => {
+      active = false
+    }
+  }, [artwork, visible])
+
+  return (
+    <div ref={hostRef} className="directory-card-artwork">
+      {artUrl ? (
+        <img
+          src={artUrl}
+          alt=""
+          loading="lazy"
+          draggable={false}
+          onError={() => {
+            if (artwork) thumbnailMemory.set(artwork.id, null)
+            setArtUrl(null)
+          }}
+        />
+      ) : <span aria-hidden="true">{card.kind === 'monster' ? '✧' : card.kind === 'spell' ? '◇' : '△'}</span>}
+    </div>
+  )
+}
+
 function CatalogView(props: CatalogViewProps): React.JSX.Element {
   const { selectedCard } = props
+  const [layout, setLayoutState] = useState<CatalogLayout>(() =>
+    window.localStorage.getItem('arcana-catalog-layout') === 'directory' ? 'directory' : 'focus'
+  )
+  const [sortKey, setSortKey] = useState<CatalogSortKey>('catalog')
+  const [sortDirection, setSortDirection] = useState<CatalogSortDirection>('asc')
+  const [directoryPage, setDirectoryPage] = useState(0)
+  const [directoryColumns, setDirectoryColumns] = useState(8)
+  const directoryGridRef = useRef<HTMLDivElement>(null)
+  const directoryCardRefs = useRef(new Map<string, HTMLButtonElement>())
+  const focusCardRefs = useRef(new Map<string, HTMLButtonElement>())
+  const pendingDirectoryFocus = useRef<string | null>(null)
+  const sortedCards = useMemo(
+    () => sortCatalogCards(props.cards, sortKey, sortDirection),
+    [props.cards, sortDirection, sortKey]
+  )
+  const pageCount = Math.max(1, Math.ceil(sortedCards.length / directoryPageSize))
+  const pageStart = directoryPage * directoryPageSize
+  const directoryCards = sortedCards.slice(pageStart, pageStart + directoryPageSize)
+  const selectedDirectoryIndex = selectedCard ? sortedCards.findIndex((card) => card.id === selectedCard.id) : -1
+
+  const setLayout = (nextLayout: CatalogLayout): void => {
+    setLayoutState(nextLayout)
+    window.localStorage.setItem('arcana-catalog-layout', nextLayout)
+    if (nextLayout === 'directory') {
+      pendingDirectoryFocus.current = selectedCard?.id ?? null
+    }
+  }
+
+  const updateSortKey = (nextKey: CatalogSortKey): void => {
+    setSortKey(nextKey)
+    setSortDirection(nextKey === 'name' || nextKey === 'type' || nextKey === 'catalog' ? 'asc' : 'desc')
+  }
+
+  const goToDirectoryPage = (nextPage: number): void => {
+    const safePage = Math.max(0, Math.min(pageCount - 1, nextPage))
+    setDirectoryPage(safePage)
+    const firstCard = sortedCards[safePage * directoryPageSize]
+    if (firstCard) {
+      pendingDirectoryFocus.current = firstCard.id
+      props.onSelect(firstCard.id)
+    }
+  }
+
+  const focusDirectoryCard = (targetIndex: number): void => {
+    if (sortedCards.length === 0) return
+    const safeIndex = Math.max(0, Math.min(sortedCards.length - 1, targetIndex))
+    const target = sortedCards[safeIndex]
+    if (!target) return
+    pendingDirectoryFocus.current = target.id
+    setDirectoryPage(Math.floor(safeIndex / directoryPageSize))
+    props.onSelect(target.id)
+  }
+
+  const handleDirectoryKeyDown = (event: React.KeyboardEvent<HTMLDivElement>): void => {
+    if (event.altKey || event.ctrlKey || event.metaKey) return
+    const currentIndex = selectedDirectoryIndex >= 0 ? selectedDirectoryIndex : pageStart
+    let targetIndex: number | null = null
+    if (event.key === 'ArrowLeft') targetIndex = currentIndex - 1
+    if (event.key === 'ArrowRight') targetIndex = currentIndex + 1
+    if (event.key === 'ArrowUp') targetIndex = currentIndex - directoryColumns
+    if (event.key === 'ArrowDown') targetIndex = currentIndex + directoryColumns
+    if (event.key === 'Home') targetIndex = event.shiftKey ? 0 : pageStart
+    if (event.key === 'End') targetIndex = event.shiftKey ? sortedCards.length - 1 : Math.min(sortedCards.length - 1, pageStart + directoryPageSize - 1)
+    if (event.key === 'PageUp') targetIndex = currentIndex - directoryPageSize
+    if (event.key === 'PageDown') targetIndex = currentIndex + directoryPageSize
+    if (event.key === 'Enter' && selectedCard) {
+      event.preventDefault()
+      setLayout('focus')
+      return
+    }
+    if (targetIndex == null) return
+    event.preventDefault()
+    focusDirectoryCard(targetIndex)
+  }
+
+  useEffect(() => {
+    if (directoryPage < pageCount) return
+    setDirectoryPage(Math.max(0, pageCount - 1))
+  }, [directoryPage, pageCount])
+
+  useEffect(() => {
+    if (selectedDirectoryIndex < 0 || layout !== 'directory') return
+    setDirectoryPage(Math.floor(selectedDirectoryIndex / directoryPageSize))
+  }, [layout, selectedDirectoryIndex, sortDirection, sortKey])
+
+  useEffect(() => {
+    if (layout !== 'directory') return
+    const grid = directoryGridRef.current
+    if (!grid) return
+    const measure = (): void => {
+      const columns = window.getComputedStyle(grid).gridTemplateColumns.split(' ').filter(Boolean).length
+      setDirectoryColumns(Math.max(1, columns))
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(grid)
+    return () => observer.disconnect()
+  }, [layout])
+
+  useEffect(() => {
+    const cardId = pendingDirectoryFocus.current
+    if (!cardId || layout !== 'directory') return
+    const frame = requestAnimationFrame(() => {
+      const target = directoryCardRefs.current.get(cardId)
+      if (!target) return
+      target.focus()
+      target.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+      pendingDirectoryFocus.current = null
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [directoryPage, layout, selectedCard?.id])
+
+  useEffect(() => {
+    if (layout !== 'focus' || !selectedCard) return
+    const frame = requestAnimationFrame(() => {
+      focusCardRefs.current.get(selectedCard.id)?.scrollIntoView({ block: 'nearest' })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [layout, selectedCard?.id])
+
   return (
-    <div className="catalog-view">
+    <div className={`catalog-view catalog-mode-${layout}`}>
       <section className="search-panel">
-        <div className="search-field">
-          <Glyph>⌕</Glyph>
-          <input
-            data-card-search
-            value={props.query}
-            onChange={(event) => props.onQuery(event.target.value)}
-            placeholder="搜尋卡名、效果、系列、種族或密碼；密碼可用 * 與 ?…"
-            aria-label="搜尋卡片"
-          />
-          <kbd>Ctrl K</kbd>
+        <div className="search-primary-row">
+          <div className="search-field">
+            <Glyph>⌕</Glyph>
+            <input
+              data-card-search
+              value={props.query}
+              onChange={(event) => props.onQuery(event.target.value)}
+              placeholder="搜尋卡名、效果、系列、種族或密碼；密碼可用 * 與 ?…"
+              aria-label="搜尋卡片"
+            />
+            <kbd>Ctrl K</kbd>
+          </div>
+          <div className="catalog-layout-switch" role="group" aria-label="卡片圖鑑檢視模式">
+            <button
+              type="button"
+              className={layout === 'focus' ? 'is-active' : ''}
+              aria-pressed={layout === 'focus'}
+              onClick={() => setLayout('focus')}
+            ><Glyph>▤</Glyph><span><strong>詳細檢視</strong><small>單張卡片與資訊</small></span></button>
+            <button
+              type="button"
+              className={layout === 'directory' ? 'is-active' : ''}
+              aria-pressed={layout === 'directory'}
+              onClick={() => setLayout('directory')}
+            ><Glyph>▦</Glyph><span><strong>網格目錄</strong><small>大量瀏覽與選取</small></span></button>
+          </div>
         </div>
         <div className="filter-row">
           <button type="button" className="advanced-filter-button" onClick={props.onOpenAdvancedFilters}>
@@ -371,23 +640,145 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
           </button>
           <span className="password-hint">密碼萬用字元：<code>*3</code> 尾號為 3，<code>12?4*</code> 的 ? 代表單一數字</span>
           <button type="button" className="filter-reset" onClick={props.onClearFilters}>清除篩選</button>
-          <span className="result-count">找到 <strong>{props.cards.length}</strong> 張</span>
+          <label className="catalog-sort-control">
+            <span>排列</span>
+            <select
+              value={sortKey}
+              onChange={(event) => updateSortKey(event.target.value as CatalogSortKey)}
+              aria-label="卡片排序方式"
+            >
+              {catalogSortOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+          </label>
+          <button
+            type="button"
+            className="sort-direction-button"
+            onClick={() => setSortDirection((current) => current === 'asc' ? 'desc' : 'asc')}
+            aria-label={sortDirection === 'asc' ? '目前升冪，切換為降冪' : '目前降冪，切換為升冪'}
+            title={sortDirection === 'asc' ? '升冪排列' : '降冪排列'}
+          >{sortDirection === 'asc' ? '↑' : '↓'} <span>{sortDirection === 'asc' ? '升冪' : '降冪'}</span></button>
+          <span className="result-count">找到 <strong>{sortedCards.length}</strong> 張</span>
         </div>
       </section>
 
-      <div className="catalog-content">
+      {layout === 'directory' ? (
+        <section className="directory-shell" aria-label="卡片網格目錄">
+          <header className="directory-heading">
+            <div>
+              <span className="eyebrow">CARD DIRECTORY</span>
+              <h2>全卡目錄</h2>
+              <p>{catalogSortLabel(sortKey)}・{sortDirection === 'asc' ? '升冪' : '降冪'}・每頁最多 {directoryPageSize} 張</p>
+            </div>
+            <div className="directory-key-help" aria-label="鍵盤操作提示">
+              <span><kbd>←↑↓→</kbd> 選擇鄰近卡牌</span>
+              <span><kbd>Enter</kbd> 開啟詳細檢視</span>
+              <span><kbd>PgUp</kbd><kbd>PgDn</kbd> 跨頁</span>
+            </div>
+          </header>
+
+          {directoryCards.length > 0 ? (
+            <div
+              ref={directoryGridRef}
+              className="directory-card-grid"
+              role="grid"
+              aria-label={`第 ${directoryPage + 1} 頁卡片，${catalogSortLabel(sortKey)}`}
+              onKeyDown={handleDirectoryKeyDown}
+            >
+              {directoryCards.map((card, pageIndex) => {
+                const absoluteIndex = pageStart + pageIndex
+                const isSelected = selectedCard?.id === card.id
+                return (
+                  <button
+                    ref={(node) => {
+                      if (node) directoryCardRefs.current.set(card.id, node)
+                      else directoryCardRefs.current.delete(card.id)
+                    }}
+                    type="button"
+                    role="gridcell"
+                    key={card.id}
+                    id={`directory-card-${card.id}`}
+                    className={`directory-card-tile ${isSelected ? 'is-selected' : ''} ${card.isUnpopular ? 'is-unpopular' : ''}`}
+                    style={{ '--card-accent': card.accent } as React.CSSProperties}
+                    tabIndex={isSelected || (selectedDirectoryIndex < 0 && pageIndex === 0) ? 0 : -1}
+                    aria-selected={isSelected}
+                    aria-label={`${card.nameZh}，${cardProgressionLabel(card)}，${card.kind === 'monster' ? `攻擊力 ${card.atk ?? '未知'}，守備力 ${card.def ?? '未知'}` : card.typeLine}`}
+                    onClick={() => props.onSelect(card.id)}
+                    onDoubleClick={() => setLayout('focus')}
+                  >
+                    <span className="directory-index">{String(absoluteIndex + 1).padStart(4, '0')}</span>
+                    <span className={`directory-card-face frame-${card.frame} ${card.pendulumScaleLeft != null ? 'is-pendulum' : ''}`}>
+                      <DirectoryCardArtwork card={card} />
+                      <span className="directory-card-title">{card.nameZh}</span>
+                      <span className="directory-card-level">{cardProgressionLabel(card)}</span>
+                    </span>
+                    <span className="directory-card-caption">
+                      <strong>{card.nameZh}</strong>
+                      <small>{card.kind === 'monster' ? `ATK ${card.atk ?? '—'} / DEF ${card.def ?? '—'}` : card.typeLine}</small>
+                    </span>
+                    {card.isUnpopular && <span className="directory-unpopular-badge">冷門</span>}
+                  </button>
+                )
+              })}
+            </div>
+          ) : (
+            <div className="empty-state directory-empty-state"><span>⌕</span><strong>沒有符合條件的卡片</strong><p>試著移除效果標籤或使用較短的關鍵字。</p></div>
+          )}
+
+          <footer className="directory-footer">
+            <div className="directory-pagination" aria-label="目錄分頁">
+              <button type="button" onClick={() => goToDirectoryPage(0)} disabled={directoryPage === 0}>«</button>
+              <button type="button" onClick={() => goToDirectoryPage(directoryPage - 1)} disabled={directoryPage === 0}>‹ 上一頁</button>
+              <span>第 <strong>{directoryPage + 1}</strong> / {pageCount} 頁</span>
+              <button type="button" onClick={() => goToDirectoryPage(directoryPage + 1)} disabled={directoryPage >= pageCount - 1}>下一頁 ›</button>
+              <button type="button" onClick={() => goToDirectoryPage(pageCount - 1)} disabled={directoryPage >= pageCount - 1}>»</button>
+            </div>
+            <span className="directory-range">
+              {sortedCards.length > 0 ? `${pageStart + 1}–${Math.min(pageStart + directoryPageSize, sortedCards.length)} / ${sortedCards.length}` : '0 / 0'}
+            </span>
+          </footer>
+
+          {selectedCard && selectedDirectoryIndex >= 0 && (
+            <aside className="directory-selection-dock" aria-live="polite">
+              <div className="directory-selection-identity">
+                <span className={`selection-kind-mark frame-${selectedCard.frame}`} aria-hidden="true">
+                  {selectedCard.kind === 'monster' ? '✧' : selectedCard.kind === 'spell' ? '◇' : '△'}
+                </span>
+                <div>
+                  <small>SELECTED CARD</small>
+                  <strong>{selectedCard.nameZh}</strong>
+                  <span>{selectedCard.nameJa || selectedCard.nameEn || selectedCard.typeLine}</span>
+                </div>
+              </div>
+              <div className="directory-selection-stats">
+                <span><small>類型</small><strong>{selectedCard.typeLine}</strong></span>
+                <span><small>等級資訊</small><strong>{cardProgressionLabel(selectedCard)}</strong></span>
+                <span><small>ATK / DEF</small><strong>{selectedCard.kind === 'monster' ? `${selectedCard.atk ?? '—'} / ${selectedCard.def ?? '—'}` : '—'}</strong></span>
+                <span><small>首次發行</small><strong>{cardReleaseDate(selectedCard) ?? '資料未提供'}</strong></span>
+              </div>
+              <div className="directory-selection-actions">
+                <button type="button" className="directory-detail-button" onClick={() => setLayout('focus')}>查看卡片 <Glyph>↗</Glyph></button>
+                <button type="button" className="directory-studio-button" onClick={props.onOpenStudio}>藝術加工室</button>
+              </div>
+            </aside>
+          )}
+        </section>
+      ) : <div className="catalog-content">
         <section className="catalog-grid-panel">
           <div className="section-heading">
             <div>
               <span className="eyebrow">LOCAL COLLECTION</span>
               <h2>精選卡片</h2>
             </div>
-            <span>依圖鑑順序</span>
+            <span>{catalogSortLabel(sortKey)}・{sortDirection === 'asc' ? '升冪' : '降冪'}</span>
           </div>
-          {props.cards.length > 0 ? (
+          {sortedCards.length > 0 ? (
             <div className="card-grid">
-              {props.cards.map((card) => (
+              {sortedCards.map((card) => (
                 <button
+                  ref={(node) => {
+                    if (node) focusCardRefs.current.set(card.id, node)
+                    else focusCardRefs.current.delete(card.id)
+                  }}
                   type="button"
                   key={card.id}
                   className={`catalog-card ${selectedCard?.id === card.id ? 'is-selected' : ''} ${card.isUnpopular ? 'is-unpopular' : ''}`}
@@ -550,7 +941,7 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
             </button>
           </aside>
         )}
-      </div>
+      </div>}
     </div>
   )
 }
