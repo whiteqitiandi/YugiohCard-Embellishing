@@ -5,13 +5,17 @@ import type {
   CatalogUpdateRequest,
   SpellTrapIcon
 } from '../shared/catalog'
+import { waitForUpdate } from './update-control'
 
 export const YGOPRODECK_SOURCE_NAME = 'YGOPRODeck API v7'
 export const YGOPRODECK_GUIDE_URL = 'https://ygoprodeck.com/api-guide/'
 
 const CARD_ENDPOINT = 'https://db.ygoprodeck.com/api/v7/cardinfo.php'
+const VERSION_ENDPOINT = 'https://db.ygoprodeck.com/api/v7/checkDBVer.php'
 const PAGE_SIZE = 100
+const INVENTORY_PAGE_SIZE = 500
 const MAX_CARDS_PER_MONTH = 1_000
+const MAX_INVENTORY_CARDS = 20_000
 const REQUEST_INTERVAL_MS = 1_000
 const RESPONSE_SIZE_LIMIT = 12 * 1024 * 1024
 
@@ -73,6 +77,7 @@ export interface CatalogImportArtwork {
   id: string
   variantLabel: string
   sourceUrl: string
+  sourceName?: string
   shardKey: string
 }
 
@@ -112,6 +117,7 @@ export interface CatalogImportRecord {
   pendulumTextZh?: string | null
   localizationSourceName?: string
   localizationSourceUrl?: string
+  localizationStatus?: 'zh-tw-converted' | 'english-fallback'
 }
 
 export interface SourceMonthResult {
@@ -121,8 +127,17 @@ export interface SourceMonthResult {
   requestsUsed: number
 }
 
-const wait = (milliseconds: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, milliseconds))
+export interface SourceInventoryResult extends SourceMonthResult {
+  totalRows: number
+}
+
+export interface SourceDatabaseVersion {
+  version: string
+  lastUpdate: string | null
+  requestsUsed: number
+}
+
+export interface SourceLookupResult extends SourceMonthResult {}
 
 const asString = (value: unknown): string | null =>
   typeof value === 'string' && value.trim() ? value.trim() : null
@@ -228,7 +243,7 @@ export const validateCatalogUpdateRequest = (value: unknown): CatalogUpdateReque
     throw new Error('發行月份必須介於 1 與 12 之間。')
   }
   if (input.region !== 'ocg' && input.region !== 'tcg') throw new Error('請選擇 OCG 或 TCG 發行地區。')
-  if (input.mode !== 'month' && input.mode !== 'through') throw new Error('請選擇單月或截至月份更新。')
+  if (input.mode !== 'month' && input.mode !== 'through' && input.mode !== 'repair') throw new Error('請選擇單月、截至月份更新或缺漏補查。')
   return { mode: input.mode, year: Number(input.year), month: Number(input.month), region: input.region }
 }
 
@@ -381,16 +396,169 @@ const parseResponse = (text: string): YgoprodeckResponse => {
 export class YgoprodeckSource {
   private lastRequestAt = 0
 
-  private async throttle(): Promise<void> {
+  private async throttle(signal?: AbortSignal): Promise<void> {
     const elapsed = Date.now() - this.lastRequestAt
     const remaining = REQUEST_INTERVAL_MS - elapsed
-    if (remaining > 0) await wait(remaining)
+    await waitForUpdate(remaining, signal)
     this.lastRequestAt = Date.now()
+  }
+
+  async fetchDatabaseVersion(signal?: AbortSignal): Promise<SourceDatabaseVersion> {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 30_000)
+    try {
+      await this.throttle(signal)
+      const response = await fetch(VERSION_ENDPOINT, {
+        headers: { accept: 'application/json', 'user-agent': 'ArcanaArchive/0.1 catalog-integrity-audit' },
+        signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+      })
+      const text = await response.text()
+      if (!response.ok) throw new Error(`YGOPRODeck 版本端點回應 HTTP ${response.status}。`)
+      const parsed = JSON.parse(text) as unknown
+      const row = Array.isArray(parsed) && parsed[0] && typeof parsed[0] === 'object'
+        ? parsed[0] as Record<string, unknown>
+        : null
+      const version = asString(row?.database_version)
+      if (!version) throw new Error('YGOPRODeck 版本端點缺少資料庫版本。')
+      return { version, lastUpdate: asString(row?.last_update), requestsUsed: 1 }
+    } catch (error) {
+      signal?.throwIfAborted()
+      if (error instanceof Error && error.message.startsWith('YGOPRODeck')) throw error
+      if (error instanceof Error && error.name === 'AbortError') throw new Error('YGOPRODeck 版本檢查逾時。')
+      throw new Error('無法檢查 YGOPRODeck 資料庫版本。')
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
+  async fetchInventory(
+    value: unknown,
+    requestBudget: number = YGOPRODECK_POLICY.maxRequestsPerRun,
+    signal?: AbortSignal
+  ): Promise<{ request: CatalogUpdateRequest; result: SourceInventoryResult }> {
+    const request = validateCatalogUpdateRequest(value)
+    const records = new Map<number, CatalogImportRecord>()
+    let skipped = 0
+    let offset = 0
+    let requestsUsed = 0
+    let totalRows = 0
+    let complete = true
+
+    while (offset < Math.max(1, totalRows)) {
+      signal?.throwIfAborted()
+      if (requestsUsed >= requestBudget) { complete = false; break }
+      const url = new URL(CARD_ENDPOINT)
+      url.searchParams.set('misc', 'yes')
+      url.searchParams.set('sort', 'id')
+      url.searchParams.set('num', String(INVENTORY_PAGE_SIZE))
+      url.searchParams.set('offset', String(offset))
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 30_000)
+      let response: Response
+      let text: string
+      try {
+        await this.throttle(signal)
+        requestsUsed += 1
+        response = await fetch(url, {
+          headers: { accept: 'application/json', 'user-agent': 'ArcanaArchive/0.1 catalog-integrity-audit' },
+          signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+        })
+        text = await response.text()
+      } catch (error) {
+        signal?.throwIfAborted()
+        if (error instanceof Error && error.name === 'AbortError') throw new Error('YGOPRODeck 全庫清冊下載逾時。')
+        throw new Error('無法下載 YGOPRODeck 全庫清冊。')
+      } finally {
+        clearTimeout(timeout)
+      }
+      if (text.length > RESPONSE_SIZE_LIMIT) throw new Error('YGOPRODeck 全庫清冊單頁超過安全上限。')
+      const parsed = parseResponse(text)
+      if (!response.ok || !Array.isArray(parsed.data)) {
+        throw new Error(asString(parsed.error) ?? `YGOPRODeck 全庫清冊回應 HTTP ${response.status}。`)
+      }
+      totalRows = asNumber(parsed.meta?.total_rows) ?? parsed.data.length
+      if (totalRows > MAX_INVENTORY_CARDS) throw new Error(`YGOPRODeck 清冊 ${totalRows} 張，超過安全上限。`)
+      for (const raw of parsed.data) {
+        const mapped = raw && typeof raw === 'object' ? mapCard(raw as YgoprodeckCard, request) : null
+        if (mapped) records.set(mapped.remoteId, mapped)
+        else skipped += 1
+      }
+      if (parsed.data.length === 0) break
+      offset += parsed.data.length
+      if (offset >= totalRows || asNumber(parsed.meta?.rows_remaining) === 0) break
+    }
+
+    return {
+      request,
+      result: {
+        records: [...records.values()].sort((left, right) => left.remoteId - right.remoteId),
+        skipped,
+        complete,
+        requestsUsed,
+        totalRows
+      }
+    }
+  }
+
+  async fetchByPasscodes(
+    value: unknown,
+    passcodes: string[],
+    requestBudget: number,
+    signal?: AbortSignal
+  ): Promise<{ request: CatalogUpdateRequest; result: SourceLookupResult }> {
+    const request = validateCatalogUpdateRequest(value)
+    const uniquePasscodes = [...new Set(passcodes.filter((passcode) => /^\d{8}$/.test(passcode)))]
+    const validPasscodes = uniquePasscodes.slice(0, 500)
+    const records = new Map<number, CatalogImportRecord>()
+    let skipped = 0
+    let requestsUsed = 0
+    let complete = uniquePasscodes.length <= validPasscodes.length
+    for (let offset = 0; offset < validPasscodes.length; offset += 50) {
+      signal?.throwIfAborted()
+      if (requestsUsed >= requestBudget) { complete = false; break }
+      const url = new URL(CARD_ENDPOINT)
+      url.searchParams.set('id', validPasscodes.slice(offset, offset + 50).join(','))
+      url.searchParams.set('misc', 'yes')
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 30_000)
+      let response: Response
+      let text: string
+      try {
+        await this.throttle(signal)
+        requestsUsed += 1
+        response = await fetch(url, {
+          headers: { accept: 'application/json', 'user-agent': 'ArcanaArchive/0.1 catalog-targeted-integrity-check' },
+          signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+        })
+        text = await response.text()
+      } catch (error) {
+        signal?.throwIfAborted()
+        if (error instanceof Error && error.name === 'AbortError') throw new Error('YGOPRODeck 定向卡片補查逾時。')
+        throw new Error('無法執行 YGOPRODeck 定向卡片補查。')
+      } finally {
+        clearTimeout(timeout)
+      }
+      if (text.length > RESPONSE_SIZE_LIMIT) throw new Error('YGOPRODeck 定向補查回應超過安全上限。')
+      const parsed = parseResponse(text)
+      if (!response.ok || !Array.isArray(parsed.data)) {
+        throw new Error(asString(parsed.error) ?? `YGOPRODeck 定向補查回應 HTTP ${response.status}。`)
+      }
+      for (const raw of parsed.data) {
+        const mapped = raw && typeof raw === 'object' ? mapCard(raw as YgoprodeckCard, request) : null
+        if (mapped) records.set(mapped.remoteId, mapped)
+        else skipped += 1
+      }
+    }
+    return {
+      request,
+      result: { records: [...records.values()], skipped, complete, requestsUsed }
+    }
   }
 
   async fetchReleaseMonth(
     value: unknown,
-    requestBudget: number = YGOPRODECK_POLICY.maxRequestsPerRun
+    requestBudget: number = YGOPRODECK_POLICY.maxRequestsPerRun,
+    signal?: AbortSignal
   ): Promise<{ request: CatalogUpdateRequest; result: SourceMonthResult }> {
     const request = validateCatalogUpdateRequest(value)
     const range = getDateRange(request.year, request.month)
@@ -402,6 +570,7 @@ export class YgoprodeckSource {
     let complete = true
 
     while (true) {
+      signal?.throwIfAborted()
       if (requestsUsed >= requestBudget) {
         complete = false
         break
@@ -420,14 +589,14 @@ export class YgoprodeckSource {
       let response: Response
       let text: string
       try {
-        await this.throttle()
+        await this.throttle(signal)
         requestsUsed += 1
         response = await fetch(url, {
           headers: {
             accept: 'application/json',
             'user-agent': 'ArcanaArchive/0.1 personal-local-catalog (month-scoped; single-worker)'
           },
-          signal: controller.signal
+          signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
         })
         const contentLength = Number(response.headers.get('content-length') ?? 0)
         if (contentLength > RESPONSE_SIZE_LIMIT) {
@@ -436,12 +605,14 @@ export class YgoprodeckSource {
         }
         text = await response.text()
       } catch (error) {
+        signal?.throwIfAborted()
         if (error instanceof RangeError) throw error
         if (error instanceof Error && error.name === 'AbortError') throw new Error('YGOPRODeck 連線逾時，未變更本機資料。')
         throw new Error('無法連線至 YGOPRODeck，請檢查網路後再試。')
       } finally {
         clearTimeout(timeout)
       }
+      signal?.throwIfAborted()
 
       if (text.length > RESPONSE_SIZE_LIMIT) throw new Error('來源回應超過單頁安全上限，已停止更新。')
       const parsed = parseResponse(text)

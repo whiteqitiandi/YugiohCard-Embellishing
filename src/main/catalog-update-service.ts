@@ -1,12 +1,14 @@
 import type {
   CardLanguage,
+  CatalogMissingField,
   CatalogCoverage,
   CatalogSourcePolicy,
+  CatalogUpdateProgress,
   CatalogUpdateRequest,
   CatalogUpdateResult,
   ReleaseRegion
 } from '../shared/catalog'
-import { CatalogDatabase } from './catalog-database'
+import type { CatalogDatabase, CatalogPendingRecord } from './catalog-database'
 import {
   type CatalogImportRecord,
   validateCatalogUpdateRequest,
@@ -20,9 +22,16 @@ import {
   YGOCDB_SOURCE_NAME,
   YgocdbSource
 } from './ygocdb-source'
+import { YGORESOURCES_POLICY, YGORESOURCES_SOURCE_NAME, YgoresourcesSource } from './ygoresources-source'
 
-const COMBINED_SOURCE_NAME = `${YGOPRODECK_SOURCE_NAME}＋${YGOCDB_SOURCE_NAME}`
+const COMBINED_SOURCE_NAME = `${YGOPRODECK_SOURCE_NAME}＋${YGOCDB_SOURCE_NAME}＋${YGORESOURCES_SOURCE_NAME}`
 const EARLIEST_MONTH: Record<ReleaseRegion, string> = { ocg: '1999-01', tcg: '2002-01' }
+
+export interface CatalogRunOptions {
+  signal?: AbortSignal
+  onProgress?: (progress: CatalogUpdateProgress) => void
+  repairRecords?: CatalogPendingRecord[]
+}
 
 interface RunTotals {
   fetched: number
@@ -72,14 +81,19 @@ const endOfMonth = (value: string): string => {
 
 const afterCompletedDate = (value: string): string => nextMonth(value.slice(0, 7))
 
-const requiredLanguageGaps = (
+const missingFields = (
   card: CatalogImportRecord,
-  localization: ChineseLocalization | undefined
-): CardLanguage[] => {
-  const gaps: CardLanguage[] = []
-  if (!localization?.nameZh || !localization.ruleTextZh) gaps.push('zh')
-  if (card.tcgReleaseDate && !(localization?.nameEn || card.name)) gaps.push('en')
-  if (card.ocgReleaseDate && !localization?.nameJa) gaps.push('ja')
+  localization: ChineseLocalization | undefined,
+  region: ReleaseRegion
+): CatalogMissingField[] => {
+  const gaps: CatalogMissingField[] = []
+  if (!localization?.nameZh) gaps.push('nameZh')
+  if (!localization?.ruleTextZh) gaps.push('ruleTextZh')
+  // OCG updates require only Chinese, including cards also released in the TCG.
+  if (region !== 'ocg') {
+    if (card.tcgReleaseDate && !(localization?.nameEn || card.name)) gaps.push('nameEn')
+    if (card.ocgReleaseDate && !localization?.nameJa) gaps.push('nameJa')
+  }
   return gaps
 }
 
@@ -88,11 +102,6 @@ const countLanguageGaps = (analyses: Array<{ gaps: CardLanguage[] }>): Record<Ca
   en: analyses.filter((item) => item.gaps.includes('en')).length,
   ja: analyses.filter((item) => item.gaps.includes('ja')).length
 })
-
-const formatLanguageGaps = (gaps: Record<CardLanguage, number>): string =>
-  ([['zh', '中文'], ['en', '英文'], ['ja', '日文']] as const)
-    .flatMap(([key, label]) => gaps[key] > 0 ? [`${label} ${gaps[key]} 張`] : [])
-    .join('、')
 
 const addLanguageGaps = (
   totals: RunTotals,
@@ -113,85 +122,278 @@ const applyLocalization = (
 ): CatalogImportRecord => ({
   ...card,
   konamiId: localization.konamiId ?? card.konamiId,
-  nameZh: localization.nameZh as string,
+  nameZh: localization.nameZh ?? '',
   nameJa: localization.nameJa ?? '',
   nameEn: localization.nameEn ?? card.name,
-  ruleTextZh: localization.ruleTextZh as string,
+  ruleTextZh: localization.ruleTextZh ?? '',
   pendulumTextZh: localization.pendulumTextZh,
   localizationSourceName: `${YGOCDB_SOURCE_NAME} 中／日名稱＋${YGOPRODECK_SOURCE_NAME} 英文＋OpenCC 台灣正體`,
   localizationSourceUrl: localization.sourceUrl
 })
 
-export class CatalogUpdateService {
-  private readonly metadataSource = new YgoprodeckSource()
-  private readonly chineseSource = new YgocdbSource()
+const applyFallbackLocalization = (
+  card: CatalogImportRecord,
+  localization: ChineseLocalization | undefined,
+  fields: CatalogMissingField[]
+): CatalogImportRecord => fields.length === 0 && localization
+  ? applyLocalization(card, localization)
+  : {
+      ...card,
+      nameZh: localization?.nameZh ?? card.name,
+      nameJa: localization?.nameJa ?? '',
+      nameEn: localization?.nameEn ?? card.name,
+      ruleTextZh: localization?.ruleTextZh ?? card.ruleText,
+      pendulumTextZh: localization?.pendulumTextZh ?? card.pendulumText,
+      localizationSourceName: localization
+        ? `${YGOCDB_SOURCE_NAME} 部分語系＋${YGOPRODECK_SOURCE_NAME} 英文暫代`
+        : `${YGOPRODECK_SOURCE_NAME} 英文暫代`,
+      localizationSourceUrl: localization?.sourceUrl ?? card.sourceUrl,
+      localizationStatus: 'english-fallback'
+    }
 
-  constructor(private readonly database: CatalogDatabase) {}
+type UpdateDatabase = Pick<CatalogDatabase,
+  'getCoverage' | 'saveCoverage' | 'importSourceMonth' | 'savePendingCards' | 'resolvePendingCards' | 'pendingRecords'
+> & Partial<Pick<CatalogDatabase,
+  'getMetaValue' | 'setMetaValue' | 'recordsNeedingLocalization' | 'refreshSourceRecords' |
+  'passcodesNeedingSourceRefresh' | 'catalogPasscodes'
+>>
+
+type MetadataSource = Pick<YgoprodeckSource, 'fetchReleaseMonth'> & Partial<Pick<YgoprodeckSource,
+  'fetchDatabaseVersion' | 'fetchInventory' | 'fetchByPasscodes'
+>>
+
+export class CatalogUpdateService {
+  constructor(
+    private readonly database: UpdateDatabase,
+    private readonly metadataSource: MetadataSource = new YgoprodeckSource(),
+    private readonly chineseSource: Pick<YgocdbSource, 'localize'> = new YgocdbSource(),
+    private readonly artworkSource: (Pick<YgoresourcesSource, 'enrich'> & Partial<Pick<YgoresourcesSource, 'fetchVersion'>>) | null = new YgoresourcesSource()
+  ) {}
 
   policies(): CatalogSourcePolicy[] {
-    return [YGOPRODECK_POLICY, YGOCDB_POLICY]
+    return [YGOPRODECK_POLICY, YGOCDB_POLICY, YGORESOURCES_POLICY]
   }
 
-  async run(value: unknown): Promise<CatalogUpdateResult> {
+  repairQueue(request: CatalogUpdateRequest): CatalogPendingRecord[] {
+    return this.database.pendingRecords(request.region, monthKey(request.year, request.month))
+  }
+
+  private saveCoverage(coverage: CatalogCoverage): CatalogCoverage {
+    this.database.saveCoverage(coverage)
+    return this.database.getCoverage(coverage.region)
+  }
+
+  private importLocalized(
+    cards: CatalogImportRecord[], localizations: Map<string, ChineseLocalization>,
+    request: CatalogUpdateRequest, totals: RunTotals, allowFallback = false
+  ): void {
+    const analyses = cards.map((card) => {
+      const localization = localizations.get(card.passcode)
+      const fields = missingFields(card, localization, request.region)
+      const gaps = [...new Set(fields.map((field): CardLanguage => field === 'nameJa' ? 'ja' : field === 'nameEn' ? 'en' : 'zh'))]
+      return { card, localization, fields, gaps }
+    })
+    addLanguageGaps(totals, analyses)
+    // Persist incomplete payloads before advancing the scan cursor. Successful cards alone enter the catalog.
+    this.database.savePendingCards(analyses.filter((item) => item.fields.length > 0).map((item) => ({
+      card: item.localization ? applyLocalization(item.card, item.localization) : item.card,
+      missingFields: item.fields,
+      reason: item.localization ? '來源尚未提供必要欄位' : '中文來源未回傳此卡片',
+      releaseMonth: monthKey(request.year, request.month)
+    })), request.region)
+    const importable = analyses.flatMap(({ card, localization, fields }): CatalogImportRecord[] => {
+      if (localization && fields.length === 0) return [applyLocalization(card, localization)]
+      return allowFallback ? [applyFallbackLocalization(card, localization, fields)] : []
+    })
+    if (importable.length > 0) {
+      const imported = this.database.importSourceMonth(importable, request)
+      totals.inserted += imported.inserted
+      totals.updated += imported.updated
+      const localized = analyses.filter((item) => item.localization && item.fields.length === 0).map((item) => item.card.passcode)
+      totals.localized += localized.length
+      this.database.resolvePendingCards(localized, request.region)
+    }
+  }
+
+  async reconcileInventory(
+    value: unknown,
+    options: CatalogRunOptions = {},
+    force = false
+  ): Promise<CatalogUpdateResult | null> {
     const request = validateCatalogUpdateRequest(value)
-    return request.mode === 'through' ? this.runThrough(request) : this.runMonth(request)
+    const fetchVersion = this.metadataSource.fetchDatabaseVersion
+    const fetchInventory = this.metadataSource.fetchInventory
+    const getMeta = this.database.getMetaValue
+    const setMeta = this.database.setMetaValue
+    const recordsNeedingLocalization = this.database.recordsNeedingLocalization
+    const refreshSourceRecords = this.database.refreshSourceRecords
+    const passcodesNeedingSourceRefresh = this.database.passcodesNeedingSourceRefresh
+    const catalogPasscodes = this.database.catalogPasscodes
+    if (!fetchVersion || !fetchInventory || !getMeta || !setMeta || !recordsNeedingLocalization || !refreshSourceRecords) return null
+
+    const totals = emptyTotals()
+    const version = await fetchVersion.call(this.metadataSource, options.signal)
+    totals.metadataRequests += version.requestsUsed
+    const versionKey = `inventory_${request.region}_ygoprodeck_version`
+    const artworkManifestVersionKey = 'artwork_ygoresources_manifest_version'
+    const artworkVersion = this.artworkSource?.fetchVersion
+      ? await this.artworkSource.fetchVersion(options.signal)
+      : null
+    if (
+      !force && getMeta.call(this.database, versionKey) === version.version &&
+      (artworkVersion == null || getMeta.call(this.database, artworkManifestVersionKey) === artworkVersion.version)
+    ) return null
+
+    const inventory = await fetchInventory.call(
+      this.metadataSource,
+      request,
+      YGOPRODECK_POLICY.maxRequestsPerRun - totals.metadataRequests,
+      options.signal
+    )
+    totals.metadataRequests += inventory.result.requestsUsed
+    totals.skipped += inventory.result.skipped
+    if (!inventory.result.complete) throw new Error('全庫清冊超過本次來源請求上限，完整性檢查未寫入。')
+
+    const inventoryByPasscode = new Map(inventory.result.records.map((card) => [card.passcode, card]))
+    if (this.metadataSource.fetchByPasscodes && passcodesNeedingSourceRefresh) {
+      const passcodes = new Set(passcodesNeedingSourceRefresh.call(this.database))
+      catalogPasscodes?.call(this.database).forEach((passcode) => {
+        if (!inventoryByPasscode.has(passcode)) passcodes.add(passcode)
+      })
+      if (passcodes.size > 0) {
+        const lookup = await this.metadataSource.fetchByPasscodes.call(
+          this.metadataSource,
+          request,
+          [...passcodes],
+          YGOPRODECK_POLICY.maxRequestsPerRun - totals.metadataRequests,
+          options.signal
+        )
+        totals.metadataRequests += lookup.result.requestsUsed
+        totals.skipped += lookup.result.skipped
+        if (!lookup.result.complete) throw new Error('定向來源補查超過本次請求上限，完整性檢查未寫入。')
+        lookup.result.records.forEach((card) => inventoryByPasscode.set(card.passcode, card))
+      }
+    }
+    const regionRecords = [...inventoryByPasscode.values()].filter((card) => card.releaseDate != null)
+    const artworkInventory = this.artworkSource
+      ? await this.artworkSource.enrich(regionRecords, options.signal)
+      : { records: regionRecords, version: 'unavailable', requestsUsed: 0, cardsWithArtwork: 0, artworkCount: 0 }
+    const candidates = recordsNeedingLocalization.call(this.database, artworkInventory.records)
+    const selected = candidates.slice(0, YGOCDB_POLICY.maxCardsPerRun)
+    const chinese = selected.length > 0
+      ? await this.chineseSource.localize(selected, options.signal)
+      : { localizations: new Map<string, ChineseLocalization>(), missingPasscodes: [], requestsUsed: 0 }
+    totals.chineseRequests += chinese.requestsUsed
+    totals.fetched = candidates.length
+    totals.updated += refreshSourceRecords.call(this.database, artworkInventory.records, request)
+    this.importLocalized(candidates, chinese.localizations, request, totals, true)
+
+    setMeta.call(this.database, versionKey, version.version)
+    setMeta.call(this.database, `inventory_${request.region}_audited_at`, new Date().toISOString())
+    setMeta.call(this.database, `inventory_${request.region}_source_rows`, String(inventory.result.totalRows))
+    setMeta.call(this.database, 'artwork_ygoresources_version', artworkInventory.version)
+    setMeta.call(this.database, 'artwork_ygoresources_count', String(artworkInventory.artworkCount))
+    if (artworkVersion) setMeta.call(this.database, artworkManifestVersionKey, artworkVersion.version)
+    const coverage = this.database.getCoverage(request.region)
+    options.onProgress?.(this.progress(request, coverage, monthKey(request.year, request.month), candidates.length, candidates.length, totals))
+    return this.buildResult(request, totals, false, 'complete', coverage)
   }
 
-  private async runMonth(request: CatalogUpdateRequest): Promise<CatalogUpdateResult> {
+  getProgress(request: CatalogUpdateRequest): CatalogUpdateProgress {
+    const coverage = this.database.getCoverage(request.region)
+    const cursor = request.mode !== 'through' ? monthKey(request.year, request.month) : this.cursor(coverage)
+    return this.progress(request, coverage, cursor, request.mode === 'through' && coverage.resumeMonth === cursor ? coverage.resumeOffset : 0, null, emptyTotals())
+  }
+
+  private cursor(coverage: CatalogCoverage): string {
+    return coverage.resumeMonth
+      ?? (coverage.scannedThrough ? afterCompletedDate(coverage.scannedThrough) : EARLIEST_MONTH[coverage.region])
+  }
+
+  private progress(
+    request: CatalogUpdateRequest, coverage: CatalogCoverage, currentMonth: string,
+    monthProcessed: number, monthTotal: number | null, totals: RunTotals
+  ): CatalogUpdateProgress {
+    const index = (key: string): number => {
+      const { year, month } = parseMonthKey(key)
+      return year * 12 + month - 1
+    }
+    const target = monthKey(request.year, request.month)
+    const start = request.mode === 'month' ? target : EARLIEST_MONTH[request.region]
+    const totalMonths = Math.max(1, index(target) - index(start) + 1)
+    const fraction = monthTotal == null ? 0 : monthTotal === 0 ? 1 : Math.min(1, monthProcessed / monthTotal)
+    const done = Math.max(0, Math.min(totalMonths, index(currentMonth) - index(start) + fraction))
+    return {
+      currentMonth: currentMonth > target ? target : currentMonth,
+      monthProcessed, monthTotal, completedMonths: Math.floor(done), totalMonths,
+      percent: Math.min(100, done / totalMonths * 100), coverage: { ...coverage },
+      fetched: totals.fetched, inserted: totals.inserted, updated: totals.updated, deferred: totals.missingRequiredLanguages
+    }
+  }
+
+  async run(value: unknown, options: CatalogRunOptions = {}): Promise<CatalogUpdateResult> {
+    const request = validateCatalogUpdateRequest(value)
+    options.signal?.throwIfAborted()
+    if (request.mode === 'repair') return this.runRepair(request, options)
+    return request.mode === 'through' ? this.runThrough(request, options) : this.runMonth(request, options)
+  }
+
+  private async runMonth(request: CatalogUpdateRequest, options: CatalogRunOptions): Promise<CatalogUpdateResult> {
     const totals = emptyTotals()
-    const { result } = await this.metadataSource.fetchReleaseMonth(request)
+    const { result } = await this.metadataSource.fetchReleaseMonth(request, undefined, options.signal)
     totals.metadataRequests = result.requestsUsed
     totals.skipped = result.skipped
     if (!result.complete) throw new Error('單月資料超過 YGOPRODeck 本次請求上限，請稍後重試。')
 
     const selected = result.records.slice(0, YGOCDB_POLICY.maxCardsPerRun)
     totals.fetched = selected.length
-    const chinese = await this.chineseSource.localize(selected)
+    options.onProgress?.(this.progress(request, this.database.getCoverage(request.region), monthKey(request.year, request.month), 0, result.records.length, totals))
+    const chinese = await this.chineseSource.localize(selected, options.signal)
+    options.signal?.throwIfAborted()
     totals.chineseRequests = chinese.requestsUsed
-    const analyses = selected.map((card) => {
-      const localization = chinese.localizations.get(card.passcode)
-      return { card, localization, gaps: requiredLanguageGaps(card, localization) }
-    })
-    addLanguageGaps(totals, analyses)
-    const localized = analyses.flatMap(({ card, localization, gaps }): CatalogImportRecord[] => {
-      return localization == null || gaps.length > 0 ? [] : [applyLocalization(card, localization)]
-    })
-    totals.localized = localized.length
-    if (localized.length > 0) {
-      const imported = this.database.importSourceMonth(localized, request)
-      totals.inserted = imported.inserted
-      totals.updated = imported.updated
-    }
+    this.importLocalized(selected, chinese.localizations, request, totals)
     const limited = result.records.length > selected.length
+    options.onProgress?.(this.progress(request, this.database.getCoverage(request.region), monthKey(request.year, request.month), selected.length, result.records.length, totals))
     return this.buildResult(
       request,
       totals,
-      limited || totals.missingRequiredLanguages > 0,
-      totals.missingRequiredLanguages > 0 ? 'waiting-language' : limited ? 'chinese-card-limit' : 'complete',
+      limited,
+      limited ? 'chinese-card-limit' : 'complete',
       this.database.getCoverage(request.region)
     )
   }
 
-  private async runThrough(request: CatalogUpdateRequest): Promise<CatalogUpdateResult> {
+  private async runThrough(request: CatalogUpdateRequest, options: CatalogRunOptions): Promise<CatalogUpdateResult> {
     const totals = emptyTotals()
     const target = monthKey(request.year, request.month)
     let coverage = this.database.getCoverage(request.region)
-    let cursor = coverage.resumeMonth
-      ?? (coverage.completeThrough ? afterCompletedDate(coverage.completeThrough) : EARLIEST_MONTH[request.region])
+    let cursor = this.cursor(coverage)
+    let reportedMonth = cursor
+    let reportedTotal: number | null = null
+    const report = (processed: number, total: number | null): void => {
+      if (reportedMonth !== cursor) { reportedMonth = cursor; reportedTotal = null }
+      if (total != null) reportedTotal = total
+      options.onProgress?.(this.progress(request, coverage, cursor, processed, reportedTotal, totals))
+    }
 
     if (cursor > target) {
+      const audited = await this.reconcileInventory(request, options)
+      if (audited) return audited
       coverage = {
         ...coverage,
         targetMonth: target,
         status: 'complete',
-        note: `指定範圍已完整收錄至 ${coverage.completeThrough ?? target}。`
+        note: `指定範圍已掃描至 ${target}；未補齊的卡片另存缺漏清單。`
       }
-      this.database.saveCoverage(coverage)
+      coverage = this.saveCoverage(coverage)
+      report(0, null)
       return this.buildResult(request, totals, false, 'complete', coverage)
     }
 
     let stoppedBy: CatalogUpdateResult['stoppedBy'] = 'complete'
-    while (cursor <= target) {
+    months: while (cursor <= target) {
+      options.signal?.throwIfAborted()
+      report(coverage.resumeMonth === cursor ? coverage.resumeOffset : 0, null)
       if (totals.metadataRequests >= YGOPRODECK_POLICY.maxRequestsPerRun) {
         stoppedBy = 'metadata-request-limit'
         coverage = this.limitCoverage(coverage, request.region, target, cursor, 0, '已達卡片結構來源的單次請求上限。')
@@ -211,7 +413,8 @@ export class CatalogUpdateService {
       const { year, month } = parseMonthKey(cursor)
       const monthRequest: CatalogUpdateRequest = { mode: 'through', year, month, region: request.region }
       const remainingMetadataRequests = YGOPRODECK_POLICY.maxRequestsPerRun - totals.metadataRequests
-      const { result } = await this.metadataSource.fetchReleaseMonth(monthRequest, remainingMetadataRequests)
+      const { result } = await this.metadataSource.fetchReleaseMonth(monthRequest, remainingMetadataRequests, options.signal)
+      options.signal?.throwIfAborted()
       totals.metadataRequests += result.requestsUsed
       if (!result.complete) {
         stoppedBy = 'metadata-request-limit'
@@ -220,82 +423,81 @@ export class CatalogUpdateService {
       }
       totals.skipped += result.skipped
 
-      const offset = coverage.resumeMonth === cursor ? coverage.resumeOffset : 0
-      const remainingCards = YGOCDB_POLICY.maxCardsPerRun - totals.fetched
-      const remainingChineseRequests = YGOCDB_POLICY.maxRequestsPerRun - totals.chineseRequests
-      const remainingChineseCapacity = remainingChineseRequests * YGOCDB_POLICY.batchSize
-      const selected = result.records.slice(offset, offset + Math.min(remainingCards, remainingChineseCapacity))
-      totals.fetched += selected.length
-
-      if (selected.length > 0) {
-        const chinese = await this.chineseSource.localize(selected)
+      let offset = coverage.resumeMonth === cursor ? coverage.resumeOffset : 0
+      report(offset, result.records.length)
+      while (offset < result.records.length) {
+        options.signal?.throwIfAborted()
+        const remainingCards = YGOCDB_POLICY.maxCardsPerRun - totals.fetched
+        if (remainingCards <= 0 || totals.chineseRequests >= YGOCDB_POLICY.maxRequestsPerRun) {
+          stoppedBy = 'chinese-card-limit'
+          coverage = this.limitCoverage(coverage, request.region, target, cursor, offset, '已達中文來源的單批安全上限，等待下一批接續。')
+          break months
+        }
+        // Save each source-sized chunk before starting another network request.
+        const selected = result.records.slice(offset, offset + Math.min(remainingCards, YGOCDB_POLICY.batchSize))
+        const chinese = await this.chineseSource.localize(selected, options.signal)
+        options.signal?.throwIfAborted()
+        totals.fetched += selected.length
         totals.chineseRequests += chinese.requestsUsed
-        const analyses = selected.map((card) => {
-          const localization = chinese.localizations.get(card.passcode)
-          return { card, localization, gaps: requiredLanguageGaps(card, localization) }
-        })
-        const batchLanguageGaps = addLanguageGaps(totals, analyses)
-        let localizedPrefixLength = 0
-        while (
-          localizedPrefixLength < selected.length &&
-          analyses[localizedPrefixLength].gaps.length === 0
-        ) localizedPrefixLength += 1
-
-        const localized = analyses.flatMap(({ card, localization, gaps }): CatalogImportRecord[] => {
-          return localization == null || gaps.length > 0 ? [] : [applyLocalization(card, localization)]
-        })
-        totals.localized += localized.length
-        if (localized.length > 0) {
-          const imported = this.database.importSourceMonth(localized, monthRequest)
-          totals.inserted += imported.inserted
-          totals.updated += imported.updated
-        }
-        if (localizedPrefixLength < selected.length) {
-          stoppedBy = 'waiting-language'
-          const completedCount = offset + localizedPrefixLength
-          const advancedCoverage = this.advanceCompleteThrough(coverage, result.records, completedCount)
-          coverage = {
-            ...advancedCoverage,
-            region: request.region,
-            resumeMonth: cursor,
-            resumeOffset: offset + localizedPrefixLength,
-            targetMonth: target,
-            status: 'waiting-language',
-            note: `${cursor} 本批有 ${formatLanguageGaps(batchLanguageGaps)}尚未符合發行區域語系規則；其餘語系完整卡已匯入，續傳仍停在月內第 ${offset + localizedPrefixLength + 1} 張的第一個缺口。`
-          }
-          break
-        }
-      }
-
-      const nextOffset = offset + selected.length
-      if (nextOffset < result.records.length) {
-        stoppedBy = 'chinese-card-limit'
+        this.importLocalized(selected, chinese.localizations, monthRequest, totals)
+        offset += selected.length
         coverage = this.limitCoverage(
-          this.advanceCompleteThrough(coverage, result.records, nextOffset),
-          request.region,
-          target,
-          cursor,
-          nextOffset,
-          '已達中文來源的單次卡片上限。'
+          this.advanceScannedThrough(coverage, result.records, offset),
+          request.region, target, cursor, offset, '已保存月內進度，可安全接續。'
         )
-        break
+        coverage = this.saveCoverage(coverage)
+        report(offset, result.records.length)
       }
 
       coverage = {
         region: request.region,
         completeThrough: endOfMonth(cursor),
+        scannedThrough: endOfMonth(cursor),
+        pendingCards: coverage.pendingCards,
         resumeMonth: null,
         resumeOffset: 0,
         targetMonth: target,
         status: cursor === target ? 'complete' : 'source-limit',
-        note: cursor === target ? `已完整收錄至 ${endOfMonth(cursor)}。` : `已完整處理 ${cursor}，下次由 ${nextMonth(cursor)} 繼續。`
+        note: cursor === target ? `已掃描至 ${endOfMonth(cursor)}；缺漏卡片另存清單，可日後補查。` : `已掃描 ${cursor}，接續 ${nextMonth(cursor)}；缺漏不影響後續更新。`
       }
-      this.database.saveCoverage(coverage)
+      coverage = this.saveCoverage(coverage)
+      report(result.records.length, result.records.length)
       cursor = nextMonth(cursor)
     }
 
-    if (coverage.status !== 'complete') this.database.saveCoverage(coverage)
+    if (stoppedBy === 'complete') {
+      const audited = await this.reconcileInventory(request, options)
+      if (audited) return audited
+    }
+
+    if (stoppedBy !== 'complete') {
+      coverage = this.saveCoverage(coverage)
+      report(coverage.resumeMonth === cursor ? coverage.resumeOffset : 0, null)
+    }
     return this.buildResult(request, totals, stoppedBy !== 'complete', stoppedBy, coverage)
+  }
+
+  private async runRepair(request: CatalogUpdateRequest, options: CatalogRunOptions): Promise<CatalogUpdateResult> {
+    const totals = emptyTotals()
+    const queue = options.repairRecords ?? this.repairQueue(request)
+    const selected = queue.slice(0, YGOCDB_POLICY.maxCardsPerRun)
+    for (let offset = 0; offset < selected.length; offset += YGOCDB_POLICY.batchSize) {
+      options.signal?.throwIfAborted()
+      const entries = selected.slice(offset, offset + YGOCDB_POLICY.batchSize)
+      const localized = await this.chineseSource.localize(entries.map((entry) => entry.card), options.signal)
+      options.signal?.throwIfAborted()
+      totals.chineseRequests += localized.requestsUsed
+      // Preserve each saved release month; no need to download the entire month's metadata again.
+      for (const sourceMonth of new Set(entries.map((entry) => entry.releaseMonth))) {
+        const monthRequest = { ...request, ...parseMonthKey(sourceMonth) }
+        this.importLocalized(entries.filter((entry) => entry.releaseMonth === sourceMonth).map((entry) => entry.card), localized.localizations, monthRequest, totals)
+      }
+      totals.fetched += entries.length
+      const progress = this.progress(request, this.database.getCoverage(request.region), entries.at(-1)!.releaseMonth, totals.fetched, selected.length, totals)
+      options.onProgress?.({ ...progress, percent: selected.length ? totals.fetched / selected.length * 100 : 100 })
+    }
+    const limited = selected.length < queue.length
+    return this.buildResult(request, totals, limited, limited ? 'chinese-card-limit' : 'complete', this.database.getCoverage(request.region))
   }
 
   private limitCoverage(
@@ -317,7 +519,7 @@ export class CatalogUpdateService {
     }
   }
 
-  private advanceCompleteThrough(
+  private advanceScannedThrough(
     current: CatalogCoverage,
     chronologicalRecords: CatalogImportRecord[],
     completedCount: number
@@ -327,9 +529,9 @@ export class CatalogUpdateService {
     const nextIncompleteDate = chronologicalRecords[completedCount]?.releaseDate
     if (
       !lastCompletedDate || !nextIncompleteDate || lastCompletedDate >= nextIncompleteDate ||
-      (current.completeThrough != null && lastCompletedDate <= current.completeThrough)
+      (current.scannedThrough != null && lastCompletedDate <= current.scannedThrough)
     ) return current
-    return { ...current, completeThrough: lastCompletedDate }
+    return { ...current, completeThrough: lastCompletedDate, scannedThrough: lastCompletedDate }
   }
 
   private buildResult(
@@ -356,6 +558,7 @@ export class CatalogUpdateService {
       skipped: totals.skipped,
       limitReached,
       stoppedBy,
+      pendingCards: coverage.pendingCards,
       releaseCompleteThrough: coverage.completeThrough,
       resumeMonth: coverage.resumeMonth,
       sourceRequests: [

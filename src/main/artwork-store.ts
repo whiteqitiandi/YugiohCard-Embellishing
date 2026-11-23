@@ -32,16 +32,20 @@ export class ArtworkStore {
     if (!artwork?.sourceUrl) return null
     const database = this.getDatabase(artwork.shardKey)
     const cached = database
-      .prepare('SELECT mime, bytes FROM media_assets WHERE artwork_id = ?')
+      .prepare('SELECT source_url, mime, bytes FROM media_assets WHERE artwork_id = ?')
       .get(artwork.id) as DbRow | undefined
 
-    if (cached) return this.toDataUrl(String(cached.mime), cached.bytes)
+    if (cached && String(cached.source_url) === artwork.sourceUrl) {
+      return this.toDataUrl(String(cached.mime), cached.bytes)
+    }
 
     const task = this.queue.then(async () => {
       const rechecked = database
-        .prepare('SELECT mime, bytes FROM media_assets WHERE artwork_id = ?')
+        .prepare('SELECT source_url, mime, bytes FROM media_assets WHERE artwork_id = ?')
         .get(artwork.id) as DbRow | undefined
-      if (rechecked) return this.toDataUrl(String(rechecked.mime), rechecked.bytes)
+      if (rechecked && String(rechecked.source_url) === artwork.sourceUrl) {
+        return this.toDataUrl(String(rechecked.mime), rechecked.bytes)
+      }
       const result = await this.download(artwork.sourceUrl as string)
       if (!result) return null
       database
@@ -90,7 +94,9 @@ export class ArtworkStore {
 
   private async download(urlText: string): Promise<{ mime: string; bytes: Uint8Array } | null> {
     const url = new URL(urlText)
-    if (url.protocol !== 'https:' || url.hostname !== 'images.ygoprodeck.com') return null
+    const trustedHost = url.hostname === 'images.ygoprodeck.com' ||
+      url.hostname === 'ygoresources.com' || url.hostname.endsWith('.ygoresources.com')
+    if (url.protocol !== 'https:' || !trustedHost) return null
 
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 15_000)
@@ -121,4 +127,3 @@ export class ArtworkStore {
     return `data:${mime};base64,${Buffer.from(bytes).toString('base64')}`
   }
 }
-

@@ -3,8 +3,28 @@ export type CardFrame = 'normal' | 'effect' | 'ritual' | 'fusion' | 'synchro' | 
 export type SpellTrapIcon = 'continuous' | 'counter' | 'equip' | 'field' | 'quick-play' | 'ritual'
 export type ReleaseRegion = 'ocg' | 'tcg'
 export type CardLanguage = 'zh' | 'en' | 'ja'
-export type CatalogUpdateMode = 'month' | 'through'
-export type CoverageStatus = 'not-started' | 'complete' | 'source-limit' | 'waiting-language'
+export type CatalogUpdateMode = 'month' | 'through' | 'repair'
+export type CoverageStatus = 'not-started' | 'complete' | 'complete-with-gaps' | 'source-limit' | 'waiting-language'
+export type CatalogMissingField = 'nameZh' | 'ruleTextZh' | 'nameEn' | 'nameJa'
+
+export interface CatalogPendingCard {
+  region: ReleaseRegion
+  passcode: string
+  name: string
+  releaseMonth: string
+  releaseDate: string | null
+  missingFields: CatalogMissingField[]
+  reason: string
+  sourceUrl: string
+  attempts: number
+  firstSeenAt: string
+  lastCheckedAt: string
+}
+
+export interface CatalogPendingPage {
+  total: number
+  items: CatalogPendingCard[]
+}
 
 export interface CardArtwork {
   id: string
@@ -72,6 +92,8 @@ export interface CatalogCard {
 export interface CatalogCoverage {
   region: ReleaseRegion
   completeThrough: string | null
+  scannedThrough: string | null
+  pendingCards: number
   resumeMonth: string | null
   resumeOffset: number
   targetMonth: string | null
@@ -90,6 +112,11 @@ export interface CatalogStats {
   coverage: CatalogCoverage[]
 }
 
+export interface CatalogPopularityBatchResult {
+  savedIds: string[]
+  failures: Array<{ id: string; message: string }>
+}
+
 export interface CatalogUpdateRequest {
   mode: CatalogUpdateMode
   year: number
@@ -98,7 +125,7 @@ export interface CatalogUpdateRequest {
 }
 
 export interface CatalogSourcePolicy {
-  id: 'ygoprodeck' | 'ygocdb'
+  id: 'ygoprodeck' | 'ygocdb' | 'ygoresources'
   name: string
   role: string
   language: string
@@ -125,24 +152,77 @@ export interface CatalogUpdateResult {
   updated: number
   skipped: number
   limitReached: boolean
-  stoppedBy: 'complete' | 'metadata-request-limit' | 'chinese-card-limit' | 'waiting-language'
+  stoppedBy: 'complete' | 'metadata-request-limit' | 'chinese-card-limit'
+  pendingCards: number
   releaseCompleteThrough: string | null
   resumeMonth: string | null
   sourceRequests: Array<{ sourceId: CatalogSourcePolicy['id']; requests: number }>
   runCompletedAt: string
 }
 
+export interface CatalogUpdateProgress {
+  currentMonth: string
+  monthProcessed: number
+  monthTotal: number | null
+  completedMonths: number
+  totalMonths: number
+  percent: number
+  coverage: CatalogCoverage
+  fetched: number
+  inserted: number
+  updated: number
+  deferred: number
+}
+
+export type CatalogUpdateStatus = 'idle' | 'running' | 'cooling' | 'pausing' | 'paused'
+  | 'cancelling' | 'cancelled' | 'completed' | 'blocked'
+export type CatalogUpdateControl = 'pause' | 'resume' | 'cancel'
+
+export interface CatalogUpdateState {
+  revision: number
+  status: CatalogUpdateStatus
+  request: CatalogUpdateRequest | null
+  batchNumber: number
+  nextBatchAt: number | null
+  cooldownMs: number
+  progress: CatalogUpdateProgress | null
+  fetched: number
+  inserted: number
+  updated: number
+  deferred: number
+  message: string
+  lastResult: CatalogUpdateResult | null
+}
+
 export interface CatalogApi {
   listCards: () => Promise<CatalogCard[]>
   stats: () => Promise<CatalogStats>
   resolveArtwork: (artworkId: string) => Promise<string | null>
-  runUpdate: (request: CatalogUpdateRequest) => Promise<CatalogUpdateResult>
+  startUpdate: (request: CatalogUpdateRequest) => Promise<CatalogUpdateState>
+  updateState: () => Promise<CatalogUpdateState>
+  controlUpdate: (control: CatalogUpdateControl) => Promise<CatalogUpdateState>
+  onUpdateState: (callback: (state: CatalogUpdateState) => void) => () => void
   updatePolicies: () => Promise<CatalogSourcePolicy[]>
+  pendingCards: (region: ReleaseRegion, page: number) => Promise<CatalogPendingPage>
   setUnpopular: (cardId: string, isUnpopular: boolean) => Promise<boolean>
+  setUnpopularBatch: (cardIds: string[], isUnpopular: boolean) => Promise<CatalogPopularityBatchResult>
 }
 
 export type AppView = 'catalog' | 'updates' | 'studio' | 'creator' | 'deck'
 export type InterfaceScale = 0.9 | 1 | 1.15 | 1.3
+
+export interface AppSettingsSnapshot {
+  directoryPageRows: import('./directory').DirectoryPageRows
+  directoryShowArtworkVariants: boolean
+}
+
+export interface AppSettingsApi {
+  get: () => Promise<AppSettingsSnapshot>
+  setDirectoryPageRows: (rows: import('./directory').DirectoryPageRows) => Promise<AppSettingsSnapshot>
+  onDirectoryPageRowsChanged: (callback: (rows: import('./directory').DirectoryPageRows) => void) => () => void
+  setDirectoryShowArtworkVariants: (show: boolean) => Promise<AppSettingsSnapshot>
+  onDirectoryShowArtworkVariantsChanged: (callback: (show: boolean) => void) => () => void
+}
 
 export interface AppCommandsApi {
   onNavigate: (callback: (view: AppView) => void) => () => void
@@ -170,6 +250,7 @@ declare global {
       catalog: CatalogApi
       commands: AppCommandsApi
       filters: CardFiltersApi
+      settings: AppSettingsApi
       platform: string
     }
   }

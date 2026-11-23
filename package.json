@@ -5,6 +5,9 @@
   "description": "A local-first Yu-Gi-Oh! card archive and visual finishing studio prototype.",
   "main": "./out/main/index.js",
   "scripts": {
+    "test": "node scripts/test-catalog-updates.mjs && npm run test:directory",
+    "test:directory": "node --experimental-strip-types --test tests/directory-selection.test.ts",
+    "catalog:reconcile": "node scripts/run-reconcile-catalog.mjs",
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
     "preview": "electron-vite preview",

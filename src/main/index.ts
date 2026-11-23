@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { access, copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   app,
@@ -10,7 +10,13 @@ import {
   shell,
   type MenuItemConstructorOptions
 } from 'electron'
-import type { AppView, InterfaceScale } from '../shared/catalog'
+import type { AppSettingsSnapshot, AppView, InterfaceScale } from '../shared/catalog'
+import {
+  defaultDirectoryPageRows,
+  directoryPageRowOptions,
+  sanitizeDirectoryPageRows,
+  type DirectoryPageRows
+} from '../shared/directory'
 import {
   createEmptyFilterCriteria,
   matchesCardFilter,
@@ -21,10 +27,13 @@ import {
 import { ArtworkStore } from './artwork-store'
 import { CatalogDatabase } from './catalog-database'
 import { CatalogUpdateService } from './catalog-update-service'
+import { CatalogUpdateJob } from './catalog-update-job'
 
 interface ArcanaSettings {
   version: 1
   interfaceScale: InterfaceScale
+  directoryPageRows: DirectoryPageRows
+  directoryShowArtworkVariants: boolean
   savedFilters: SavedCardFilter[]
 }
 
@@ -33,8 +42,14 @@ let filterWindow: BrowserWindow | null = null
 let catalog: CatalogDatabase | null = null
 let artworkStore: ArtworkStore | null = null
 let catalogUpdateService: CatalogUpdateService | null = null
-let catalogUpdateInProgress = false
-let settings: ArcanaSettings = { version: 1, interfaceScale: 1, savedFilters: [] }
+let catalogUpdateJob: CatalogUpdateJob | null = null
+let settings: ArcanaSettings = {
+  version: 1,
+  interfaceScale: 1,
+  directoryPageRows: defaultDirectoryPageRows,
+  directoryShowArtworkVariants: false,
+  savedFilters: []
+}
 let activeFilter: CardFilterCriteria = createEmptyFilterCriteria()
 const isSmokeTest = process.argv.includes('--arcana-smoke')
 const smokeUpdate = process.argv
@@ -52,6 +67,26 @@ app.setPath(
 )
 
 const getSettingsPath = (): string => join(app.getPath('userData'), 'settings.json')
+const getCatalogPath = (): string => join(app.getPath('userData'), 'catalog.sqlite')
+
+const installBundledCatalog = async (): Promise<void> => {
+  if (isSmokeTest) return
+  try {
+    await access(getCatalogPath())
+    return
+  } catch {
+    // A missing writable database is initialized from the Git-tracked catalog snapshot below.
+  }
+  const bundledCatalog = join(app.getAppPath(), 'data', 'catalog.sqlite')
+  try {
+    await access(bundledCatalog)
+    await mkdir(app.getPath('userData'), { recursive: true })
+    await copyFile(bundledCatalog, getCatalogPath())
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? error.code : null
+    if (code !== 'ENOENT') throw error
+  }
+}
 
 const isInterfaceScale = (value: unknown): value is InterfaceScale =>
   typeof value === 'number' && interfaceScales.includes(value as InterfaceScale)
@@ -80,6 +115,8 @@ const loadSettings = async (): Promise<void> => {
     settings = {
       version: 1,
       interfaceScale: isInterfaceScale(parsed.interfaceScale) ? parsed.interfaceScale : 1,
+      directoryPageRows: sanitizeDirectoryPageRows(parsed.directoryPageRows),
+      directoryShowArtworkVariants: parsed.directoryShowArtworkVariants === true,
       savedFilters: sanitizeSavedFilters(parsed.savedFilters)
     }
   } catch (error: unknown) {
@@ -161,6 +198,35 @@ const setInterfaceScale = async (scale: InterfaceScale): Promise<void> => {
   }
 }
 
+const settingsSnapshot = (): AppSettingsSnapshot => ({
+  directoryPageRows: settings.directoryPageRows,
+  directoryShowArtworkVariants: settings.directoryShowArtworkVariants
+})
+
+const setDirectoryPageRows = async (rows: unknown): Promise<AppSettingsSnapshot> => {
+  settings.directoryPageRows = sanitizeDirectoryPageRows(rows)
+  sendToMain('settings:directory-page-rows-changed', settings.directoryPageRows)
+  buildApplicationMenu()
+  try {
+    await persistSettings()
+  } catch (error) {
+    console.error('Failed to persist directory page rows:', error)
+  }
+  return settingsSnapshot()
+}
+
+const setDirectoryShowArtworkVariants = async (show: unknown): Promise<AppSettingsSnapshot> => {
+  settings.directoryShowArtworkVariants = show === true
+  sendToMain('settings:directory-show-artwork-variants-changed', settings.directoryShowArtworkVariants)
+  buildApplicationMenu()
+  try {
+    await persistSettings()
+  } catch (error) {
+    console.error('Failed to persist directory artwork variant setting:', error)
+  }
+  return settingsSnapshot()
+}
+
 const buildApplicationMenu = (): void => {
   const scaleLabels = new Map<InterfaceScale, string>([
     [0.9, '小（90%）'],
@@ -168,6 +234,8 @@ const buildApplicationMenu = (): void => {
     [1.15, '大（115%）'],
     [1.3, '特大（130%）']
   ])
+  const directoryRowsLabel = (rows: DirectoryPageRows): string =>
+    rows === 'all' ? '全部卡片（單頁・虛擬化）' : `最多 ${rows} 列`
   const navigateItem = (label: string, view: AppView, accelerator: string): MenuItemConstructorOptions => ({
     label,
     accelerator,
@@ -244,6 +312,21 @@ const buildApplicationMenu = (): void => {
             click: () => { void setInterfaceScale(scale) }
           }))
         },
+        {
+          label: '網格目錄每頁列數',
+          submenu: directoryPageRowOptions.map((rows): MenuItemConstructorOptions => ({
+            label: directoryRowsLabel(rows),
+            type: 'radio',
+            checked: settings.directoryPageRows === rows,
+            click: () => { void setDirectoryPageRows(rows) }
+          }))
+        },
+        {
+          label: '網格顯示不同卡圖版本',
+          type: 'checkbox',
+          checked: settings.directoryShowArtworkVariants,
+          click: (item) => { void setDirectoryShowArtworkVariants(item.checked) }
+        },
         { type: 'separator' },
         {
           label: '重設介面文字大小',
@@ -314,6 +397,9 @@ const createWindow = (): void => {
 }
 
 const registerIpc = (): void => {
+  ipcMain.handle('settings:get', () => settingsSnapshot())
+  ipcMain.handle('settings:set-directory-page-rows', (_event, rows: unknown) => setDirectoryPageRows(rows))
+  ipcMain.handle('settings:set-directory-show-artwork-variants', (_event, show: unknown) => setDirectoryShowArtworkVariants(show))
   ipcMain.handle('catalog:list', () => catalog?.listCards() ?? [])
   ipcMain.handle('catalog:stats', () => catalog?.stats())
   ipcMain.handle('catalog:resolve-artwork', async (_event, artworkId: unknown) => {
@@ -321,23 +407,37 @@ const registerIpc = (): void => {
     const artwork = catalog?.getArtwork(artworkId) ?? null
     return artworkStore?.resolve(artwork) ?? null
   })
-  ipcMain.handle('catalog:update-run', async (_event, input: unknown) => {
-    if (!catalogUpdateService) throw new Error('卡片更新服務尚未準備完成。')
-    if (catalogUpdateInProgress) throw new Error('已有一個卡片更新正在進行，請等候完成。')
-    catalogUpdateInProgress = true
-    try {
-      return await catalogUpdateService.run(input)
-    } finally {
-      catalogUpdateInProgress = false
-    }
+  ipcMain.handle('catalog:update-start', (_event, input: unknown) => {
+    if (!catalogUpdateJob) throw new Error('卡片更新服務尚未準備完成。')
+    return catalogUpdateJob.start(input)
+  })
+  ipcMain.handle('catalog:update-state', () => catalogUpdateJob?.snapshot())
+  ipcMain.handle('catalog:update-control', (_event, control: unknown) => {
+    if (!catalogUpdateJob) throw new Error('卡片更新服務尚未準備完成。')
+    return catalogUpdateJob.control(control)
   })
   ipcMain.handle('catalog:update-policies', () => catalogUpdateService?.policies() ?? [])
+  ipcMain.handle('catalog:pending-cards', (_event, region: unknown, page: unknown) => {
+    if (region !== 'ocg' && region !== 'tcg') throw new Error('請選擇有效的發行地區。')
+    if (typeof page !== 'number' || !Number.isSafeInteger(page) || page < 0 || page > 100_000) throw new Error('缺漏清單頁碼不正確。')
+    return catalog?.pendingCards(region, page) ?? { total: 0, items: [] }
+  })
   ipcMain.handle('catalog:set-unpopular', (_event, cardId: unknown, isUnpopular: unknown) => {
     if (!catalog) throw new Error('卡片資料庫尚未準備完成。')
     if (typeof cardId !== 'string' || cardId.length === 0 || cardId.length > 120 || typeof isUnpopular !== 'boolean') {
       throw new Error('冷門卡片標記格式不正確。')
     }
     return catalog.setUnpopular(cardId, isUnpopular)
+  })
+  ipcMain.handle('catalog:set-unpopular-batch', (_event, cardIds: unknown, isUnpopular: unknown) => {
+    if (!catalog) throw new Error('卡片資料庫尚未準備完成。')
+    if (
+      !Array.isArray(cardIds) || cardIds.length > 100_000 || typeof isUnpopular !== 'boolean' ||
+      cardIds.some((id) => typeof id !== 'string' || id.length === 0 || id.length > 120)
+    ) {
+      throw new Error('批次冷門卡片標記格式不正確。')
+    }
+    return catalog.setUnpopularBatch(cardIds, isUnpopular)
   })
 
   ipcMain.handle('filters:open', (_event, criteria: unknown) => openFilterWindow(criteria))
@@ -378,8 +478,10 @@ const registerIpc = (): void => {
 
 app.whenReady().then(async () => {
   await loadSettings()
-  catalog = new CatalogDatabase(join(app.getPath('userData'), 'catalog.sqlite'))
+  await installBundledCatalog()
+  catalog = new CatalogDatabase(getCatalogPath())
   catalogUpdateService = new CatalogUpdateService(catalog)
+  catalogUpdateJob = new CatalogUpdateJob(catalogUpdateService, (state) => sendToMain('catalog:update-state-changed', state))
   artworkStore = new ArtworkStore(app.getPath('userData'))
   await artworkStore.initialize()
   registerIpc()
@@ -475,6 +577,8 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  catalogUpdateJob?.shutdown()
+  catalogUpdateJob = null
   artworkStore?.close()
   artworkStore = null
   catalog?.close()

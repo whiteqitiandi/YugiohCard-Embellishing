@@ -1,6 +1,7 @@
 import OpenCC from 'opencc-js'
 import type { CatalogSourcePolicy } from '../shared/catalog'
 import type { CatalogImportRecord } from './ygoprodeck-source'
+import { waitForUpdate } from './update-control'
 
 export const YGOCDB_SOURCE_NAME = '百鴿（YGOCDB）API v0'
 export const YGOCDB_GUIDE_URL = 'https://ygocdb.com/api'
@@ -58,9 +59,6 @@ export interface ChineseLocalizationResult {
 
 const toTaiwanTraditional = OpenCC.Converter({ from: 'cn', to: 'tw' })
 
-const wait = (milliseconds: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, milliseconds))
-
 const asString = (value: unknown): string | null =>
   typeof value === 'string' && value.trim() ? value.trim() : null
 
@@ -104,14 +102,14 @@ const mapLocalization = (value: unknown): ChineseLocalization | null => {
 export class YgocdbSource {
   private lastRequestAt = 0
 
-  private async throttle(): Promise<void> {
+  private async throttle(signal?: AbortSignal): Promise<void> {
     const elapsed = Date.now() - this.lastRequestAt
     const remaining = REQUEST_INTERVAL_MS - elapsed
-    if (remaining > 0) await wait(remaining)
+    await waitForUpdate(remaining, signal)
     this.lastRequestAt = Date.now()
   }
 
-  async localize(records: CatalogImportRecord[]): Promise<ChineseLocalizationResult> {
+  async localize(records: CatalogImportRecord[], signal?: AbortSignal): Promise<ChineseLocalizationResult> {
     if (records.length > YGOCDB_POLICY.maxCardsPerRun) {
       throw new Error(`百鴿中文來源單次最多處理 ${YGOCDB_POLICY.maxCardsPerRun} 張。`)
     }
@@ -119,13 +117,14 @@ export class YgocdbSource {
     let requestsUsed = 0
 
     for (let offset = 0; offset < records.length; offset += BATCH_SIZE) {
+      signal?.throwIfAborted()
       const batch = records.slice(offset, offset + BATCH_SIZE)
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), 30_000)
       let response: Response
       let text: string
       try {
-        await this.throttle()
+        await this.throttle(signal)
         requestsUsed += 1
         response = await fetch(CARDSET_ENDPOINT, {
           method: 'POST',
@@ -135,7 +134,7 @@ export class YgocdbSource {
             'user-agent': 'ArcanaArchive/0.1 personal-local-catalog (zh-TW localization; single-worker)'
           },
           body: JSON.stringify({ ids: batch.map((card) => card.remoteId) }),
-          signal: controller.signal
+          signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
         })
         const contentLength = Number(response.headers.get('content-length') ?? 0)
         if (contentLength > RESPONSE_SIZE_LIMIT) {
@@ -144,12 +143,14 @@ export class YgocdbSource {
         }
         text = await response.text()
       } catch (error) {
+        signal?.throwIfAborted()
         if (error instanceof RangeError) throw error
         if (error instanceof Error && error.name === 'AbortError') throw new Error('百鴿中文來源連線逾時，本批資料未寫入。')
         throw new Error('無法連線至百鴿中文來源，請檢查網路後再試。')
       } finally {
         clearTimeout(timeout)
       }
+      signal?.throwIfAborted()
       if (text.length > RESPONSE_SIZE_LIMIT) throw new Error('百鴿中文來源回應超過單頁安全上限，已停止更新。')
       const parsed = parseResponse(text)
       if (!response.ok) {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   AppView,
   CatalogCard,
@@ -8,8 +8,21 @@ import type {
   CatalogStats,
   CatalogUpdateRequest,
   CatalogUpdateResult,
+  CatalogUpdateState,
+  CatalogUpdateControl,
+  CatalogPendingPage,
+  CatalogMissingField,
   ReleaseRegion
 } from '../../shared/catalog'
+import {
+  calculateVirtualGridRange,
+  clampDirectoryPage,
+  directoryPageRowOptions,
+  directoryPageSize,
+  isIndexOnDirectoryPage,
+  sanitizeDirectoryPageRows,
+  type DirectoryPageRows
+} from '../../shared/directory'
 import {
   countFilterConditions,
   createEmptyFilterCriteria,
@@ -19,6 +32,13 @@ import {
 } from '../../shared/filters'
 import { seedCards } from '../../main/seed'
 import {
+  cardsInsideVirtualGrid,
+  setSelectedUnpopular,
+  type SelectionRect,
+  type UnpopularBatchResult
+} from './directorySelection'
+import { useDirectorySelection } from './useDirectorySelection'
+import {
   CardPreview,
   type CardTextMode,
   type FinishConfig,
@@ -27,6 +47,13 @@ import {
   type SurfaceEffect,
   type SurfaceScope
 } from './CardPreview'
+import {
+  catalogSortLabel,
+  catalogSortOptions,
+  sortCatalogCards,
+  type CatalogSortDirection,
+  type CatalogSortKey
+} from './catalogSorting'
 
 const defaultFinish: FinishConfig = {
   surface: 'aurora',
@@ -67,12 +94,83 @@ export function App(): React.JSX.Element {
   const [ruleset, setRuleset] = useState('ocg-master')
   const [finish, setFinish] = useState<FinishConfig>(defaultFinish)
   const [textMode, setTextMode] = useState<CardTextMode>('fit')
+  const [directoryPageRows, setDirectoryPageRowsState] = useState<DirectoryPageRows>(() =>
+    sanitizeDirectoryPageRows(window.localStorage.getItem('arcana-directory-page-rows'))
+  )
+  const [directoryShowArtworkVariants, setDirectoryShowArtworkVariantsState] = useState(() =>
+    window.localStorage.getItem('arcana-directory-show-artwork-variants') === 'true'
+  )
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [updateBusy, setUpdateBusy] = useState(false)
+  const [updateCommandBusy, setUpdateCommandBusy] = useState(false)
+  const [updateState, setUpdateState] = useState<CatalogUpdateState | null>(null)
+  const [updateReady, setUpdateReady] = useState(!window.arcana?.catalog)
   const [updateNotice, setUpdateNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null)
   const [sourcePolicies, setSourcePolicies] = useState<CatalogSourcePolicy[]>([])
   const [popularityBusyId, setPopularityBusyId] = useState<string | null>(null)
+  const [popularityBatchBusy, setPopularityBatchBusy] = useState(false)
+  const popularityOperationRef = useRef(false)
   const [popularityNotice, setPopularityNotice] = useState<{ cardId: string; tone: 'success' | 'error'; text: string } | null>(null)
+  const updateBusy = updateCommandBusy || !updateReady ||
+    (updateState != null && !['idle', 'completed', 'cancelled'].includes(updateState.status))
+
+  const acceptUpdateState = (next: CatalogUpdateState): void => {
+    setUpdateState((current) => !current || next.revision > current.revision ? next : current)
+  }
+
+  useEffect(() => {
+    const api = window.arcana?.catalog
+    if (!api) return
+    let mounted = true
+    const unsubscribe = api.onUpdateState((state) => { if (mounted) acceptUpdateState(state) })
+    void api.updateState().then((state) => {
+      if (mounted) { acceptUpdateState(state); setUpdateReady(true) }
+    }).catch(() => {
+      if (mounted) setUpdateNotice({ tone: 'error', text: '無法取得更新作業狀態，請重新載入應用程式。' })
+    })
+    return () => { mounted = false; unsubscribe() }
+  }, [])
+
+  useEffect(() => {
+    const api = window.arcana?.settings
+    if (!api) return
+    let mounted = true
+    const acceptRows = (rows: DirectoryPageRows): void => {
+      if (!mounted) return
+      setDirectoryPageRowsState(rows)
+      window.localStorage.setItem('arcana-directory-page-rows', String(rows))
+    }
+    const acceptArtworkVariants = (show: boolean): void => {
+      if (!mounted) return
+      setDirectoryShowArtworkVariantsState(show)
+      window.localStorage.setItem('arcana-directory-show-artwork-variants', String(show))
+    }
+    const unsubscribeRows = api.onDirectoryPageRowsChanged(acceptRows)
+    const unsubscribeArtworkVariants = api.onDirectoryShowArtworkVariantsChanged(acceptArtworkVariants)
+    void api.get().then((snapshot) => {
+      acceptRows(snapshot.directoryPageRows)
+      acceptArtworkVariants(snapshot.directoryShowArtworkVariants)
+    }).catch(() => undefined)
+    return () => {
+      mounted = false
+      unsubscribeRows()
+      unsubscribeArtworkVariants()
+    }
+  }, [])
+
+  useEffect(() => {
+    const api = window.arcana?.catalog
+    if (!api || !updateState || updateState.status === 'idle') return
+    let mounted = true
+    void Promise.all([api.listCards(), api.stats()]).then(([loadedCards, loadedStats]) => {
+      if (!mounted) return
+      setCards(loadedCards)
+      setStats(loadedStats)
+      setSelectedId((current) => loadedCards.some((card) => card.id === current) ? current : loadedCards[0]?.id ?? '')
+    }).catch(() => {
+      if (mounted) setUpdateNotice({ tone: 'error', text: '更新狀態已保留，但圖鑑畫面重新讀取失敗；請重新載入畫面。' })
+    })
+    return () => { mounted = false }
+  }, [updateState?.status, updateState?.batchNumber])
 
   useEffect(() => {
     const catalogApi = window.arcana?.catalog
@@ -139,7 +237,9 @@ export function App(): React.JSX.Element {
 
   useEffect(() => {
     if (!selectedCard) return
-    setArtworkId(selectedCard.artworks[0]?.id ?? '')
+    setArtworkId((current) => selectedCard.artworks.some((artwork) => artwork.id === current)
+      ? current
+      : selectedCard.artworks[0]?.id ?? '')
     setRuleset(selectedCard.ruleTexts[0]?.ruleset ?? 'ocg-master')
   }, [selectedCard?.id])
 
@@ -171,7 +271,21 @@ export function App(): React.JSX.Element {
     void window.arcana?.filters.apply(empty)
   }
 
+  const setDirectoryPageRows = (rows: DirectoryPageRows): void => {
+    setDirectoryPageRowsState(rows)
+    window.localStorage.setItem('arcana-directory-page-rows', String(rows))
+    void window.arcana?.settings?.setDirectoryPageRows(rows).catch(() => undefined)
+  }
+
+  const setDirectoryShowArtworkVariants = (show: boolean): void => {
+    setDirectoryShowArtworkVariantsState(show)
+    window.localStorage.setItem('arcana-directory-show-artwork-variants', String(show))
+    void window.arcana?.settings?.setDirectoryShowArtworkVariants(show).catch(() => undefined)
+  }
+
   const toggleUnpopular = async (card: CatalogCard): Promise<void> => {
+    if (popularityOperationRef.current) return
+    popularityOperationRef.current = true
     const nextValue = !card.isUnpopular
     const catalogApi = window.arcana?.catalog
     setPopularityBusyId(card.id)
@@ -191,6 +305,32 @@ export function App(): React.JSX.Element {
       })
     } finally {
       setPopularityBusyId(null)
+      popularityOperationRef.current = false
+    }
+  }
+
+  const setUnpopularBatch = async (cardIds: string[], isUnpopular: boolean): Promise<UnpopularBatchResult> => {
+    if (popularityOperationRef.current) {
+      return { savedIds: [], failures: cardIds.map((id) => ({ id, message: '請等待目前的標記作業完成。' })) }
+    }
+    popularityOperationRef.current = true
+    setPopularityBatchBusy(true)
+    try {
+      const catalogApi = window.arcana?.catalog
+      const result = catalogApi?.setUnpopularBatch
+        ? await catalogApi.setUnpopularBatch(cardIds, isUnpopular)
+        : await setSelectedUnpopular(cardIds, isUnpopular, catalogApi?.setUnpopular ?? (async () => true))
+      const saved = new Set(result.savedIds)
+      setCards((current) => current.map((card) => saved.has(card.id) ? { ...card, isUnpopular } : card))
+      return result
+    } catch (error: unknown) {
+      const message = error instanceof Error
+        ? error.message.replace(/^Error invoking remote method '[^']+':\s*/, '')
+        : '無法儲存批次冷門卡片標記。'
+      return { savedIds: [], failures: cardIds.map((id) => ({ id, message })) }
+    } finally {
+      popularityOperationRef.current = false
+      setPopularityBatchBusy(false)
     }
   }
 
@@ -200,24 +340,30 @@ export function App(): React.JSX.Element {
       setUpdateNotice({ tone: 'error', text: '瀏覽器預覽模式無法寫入本機資料庫，請由 Electron 應用程式執行更新。' })
       return
     }
-    setUpdateBusy(true)
-    setUpdateNotice({
-      tone: 'info',
-      text: `正在讀取 ${request.region.toUpperCase()} ${request.year} 年 ${request.month} 月的發行資料…`
-    })
+    setUpdateCommandBusy(true)
+    setUpdateNotice(null)
     try {
-      const result = await catalogApi.runUpdate(request)
-      const [loadedCards, loadedStats] = await Promise.all([catalogApi.listCards(), catalogApi.stats()])
-      setCards(loadedCards)
-      setStats(loadedStats)
-      setSelectedId((current) => loadedCards.some((card) => card.id === current) ? current : loadedCards[0]?.id ?? '')
-      setUpdateNotice({ tone: 'success', text: describeUpdateResult(result) })
+      acceptUpdateState(await catalogApi.startUpdate(request))
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+':\s*/, '') : '更新失敗，本機資料未變更。'
       setUpdateNotice({ tone: 'error', text: message })
       void catalogApi.stats().then(setStats).catch(() => undefined)
     } finally {
-      setUpdateBusy(false)
+      setUpdateCommandBusy(false)
+    }
+  }
+
+  const controlCatalogUpdate = async (control: CatalogUpdateControl): Promise<void> => {
+    const api = window.arcana?.catalog
+    if (!api || updateCommandBusy) return
+    setUpdateCommandBusy(true)
+    setUpdateNotice(null)
+    try {
+      acceptUpdateState(await api.controlUpdate(control))
+    } catch (error: unknown) {
+      setUpdateNotice({ tone: 'error', text: error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+':\s*/, '') : '無法變更更新作業狀態。' })
+    } finally {
+      setUpdateCommandBusy(false)
     }
   }
 
@@ -255,7 +401,7 @@ export function App(): React.JSX.Element {
           <small>{coverageSummary(stats?.coverage)}</small>
         </div>
         <button type="button" className={`update-center-nav ${view === 'updates' ? 'is-active' : ''}`} onClick={() => setView('updates')}>
-          <Glyph>⇩</Glyph><span><strong>資料更新中心</strong><small>中文來源・續傳進度</small></span>
+          <Glyph>⇩</Glyph><span><strong>資料更新中心</strong><small>{updateState && !['idle', 'completed', 'cancelled'].includes(updateState.status) ? `更新${updateState.status === 'cooling' ? '冷卻中' : ['paused', 'blocked'].includes(updateState.status) ? '已暫停' : '進行中'}・${Math.floor(updateState.progress?.percent ?? 0)}%` : '中文來源・續傳進度'}</small></span>
         </button>
       </aside>
 
@@ -290,14 +436,23 @@ export function App(): React.JSX.Element {
             onTextMode={setTextMode}
             onOpenStudio={openStudio}
             onToggleUnpopular={(card) => { void toggleUnpopular(card) }}
+            onSetUnpopularBatch={setUnpopularBatch}
             popularityBusyId={popularityBusyId}
+            popularityBatchBusy={popularityBatchBusy}
             popularityNotice={popularityNotice}
+            directoryPageRows={directoryPageRows}
+            onDirectoryPageRows={setDirectoryPageRows}
+            directoryShowArtworkVariants={directoryShowArtworkVariants}
+            onDirectoryShowArtworkVariants={setDirectoryShowArtworkVariants}
           />
         ) : view === 'updates' ? (
           <UpdateCenterView
             stats={stats}
             policies={sourcePolicies}
             busy={updateBusy}
+            state={updateState}
+            commandBusy={updateCommandBusy}
+            onControl={controlCatalogUpdate}
             notice={updateNotice}
             onUpdate={runCatalogUpdate}
             onCatalog={() => setView('catalog')}
@@ -343,77 +498,27 @@ interface CatalogViewProps {
   onTextMode: (value: CardTextMode) => void
   onOpenStudio: () => void
   onToggleUnpopular: (card: CatalogCard) => void
+  onSetUnpopularBatch: (cardIds: string[], isUnpopular: boolean) => Promise<UnpopularBatchResult>
   popularityBusyId: string | null
+  popularityBatchBusy: boolean
   popularityNotice: { cardId: string; tone: 'success' | 'error'; text: string } | null
+  directoryPageRows: DirectoryPageRows
+  onDirectoryPageRows: (rows: DirectoryPageRows) => void
+  directoryShowArtworkVariants: boolean
+  onDirectoryShowArtworkVariants: (show: boolean) => void
 }
 
 type CatalogLayout = 'focus' | 'directory'
-type CatalogSortKey = 'catalog' | 'name' | 'atk' | 'def' | 'level' | 'release' | 'type'
-type CatalogSortDirection = 'asc' | 'desc'
 
-const directoryPageSize = 72
+interface DirectoryCardItem {
+  id: string
+  card: CatalogCard
+  artworkId: string
+  artworkLabel: string
+  fullCardImage: boolean
+}
+
 const thumbnailMemory = new Map<string, string | null>()
-
-const catalogSortOptions: Array<{ value: CatalogSortKey; label: string }> = [
-  { value: 'catalog', label: '圖鑑順序' },
-  { value: 'name', label: '卡片名稱' },
-  { value: 'atk', label: '攻擊力 ATK' },
-  { value: 'def', label: '守備力 DEF' },
-  { value: 'level', label: '等級／階級／LINK' },
-  { value: 'release', label: '首次發行日期' },
-  { value: 'type', label: '卡片種類' }
-]
-
-const catalogSortLabel = (sortKey: CatalogSortKey): string =>
-  catalogSortOptions.find((option) => option.value === sortKey)?.label ?? '圖鑑順序'
-
-const cardProgression = (card: CatalogCard): number | null => card.level ?? card.rank ?? card.linkRating
-
-const cardReleaseDate = (card: CatalogCard): string | null => {
-  const dates = [card.releaseDate, card.ocgReleaseDate, card.tcgReleaseDate].filter((date): date is string => Boolean(date))
-  return dates.sort()[0] ?? null
-}
-
-const cardTypeSortValue = (card: CatalogCard): string =>
-  `${card.kind === 'monster' ? '0' : card.kind === 'spell' ? '1' : '2'}-${card.frame}-${card.typeLine}`
-
-const compareCatalogValues = (
-  first: string | number | null,
-  second: string | number | null,
-  direction: CatalogSortDirection
-): number => {
-  if (first == null && second == null) return 0
-  if (first == null) return 1
-  if (second == null) return -1
-  const comparison = typeof first === 'number' && typeof second === 'number'
-    ? first - second
-    : String(first).localeCompare(String(second), 'zh-Hant', { numeric: true, sensitivity: 'base' })
-  return direction === 'asc' ? comparison : -comparison
-}
-
-const sortCatalogCards = (
-  cards: CatalogCard[],
-  sortKey: CatalogSortKey,
-  direction: CatalogSortDirection
-): CatalogCard[] => {
-  if (sortKey === 'catalog') return direction === 'asc' ? [...cards] : [...cards].reverse()
-  const valueFor = (card: CatalogCard): string | number | null => {
-    if (sortKey === 'name') return card.nameZh || card.nameJa || card.nameEn
-    if (sortKey === 'atk') return card.atk
-    if (sortKey === 'def') return card.def
-    if (sortKey === 'level') return cardProgression(card)
-    if (sortKey === 'release') return cardReleaseDate(card)
-    return cardTypeSortValue(card)
-  }
-  return cards
-    .map((card, index) => ({ card, index }))
-    .sort((first, second) => {
-      const comparison = compareCatalogValues(valueFor(first.card), valueFor(second.card), direction)
-      if (comparison !== 0) return comparison
-      return first.index - second.index
-    })
-    .map(({ card }) => card)
-}
 
 const cardProgressionLabel = (card: CatalogCard): string => {
   if (card.rank != null) return `RANK ${card.rank}`
@@ -422,9 +527,14 @@ const cardProgressionLabel = (card: CatalogCard): string => {
   return card.typeLine
 }
 
-function DirectoryCardArtwork({ card }: { card: CatalogCard }): React.JSX.Element {
-  const artwork = card.artworks[0]
-  const remembered = artwork ? thumbnailMemory.get(artwork.id) : null
+const DirectoryCardArtwork = memo(function DirectoryCardArtwork({ card, artworkId, fullCardImage }: {
+  card: CatalogCard
+  artworkId: string
+  fullCardImage: boolean
+}): React.JSX.Element {
+  const artwork = card.artworks.find((candidate) => candidate.id === artworkId) ?? card.artworks[0]
+  const cacheKey = artwork ? `${artwork.id}::${artwork.sourceUrl ?? ''}` : artworkId
+  const remembered = thumbnailMemory.get(cacheKey)
   const [artUrl, setArtUrl] = useState<string | null>(remembered ?? null)
   const [visible, setVisible] = useState(false)
   const hostRef = useRef<HTMLDivElement>(null)
@@ -443,27 +553,28 @@ function DirectoryCardArtwork({ card }: { card: CatalogCard }): React.JSX.Elemen
 
   useEffect(() => {
     if (!visible || !artwork) return
-    const cached = thumbnailMemory.get(artwork.id)
+    const cached = thumbnailMemory.get(cacheKey)
     if (cached !== undefined) {
       setArtUrl(cached)
       return
     }
+    setArtUrl(null)
     let active = true
     const resolver = window.arcana?.catalog.resolveArtwork ?? (() => Promise.resolve(artwork.sourceUrl))
     void resolver(artwork.id).then((resolved) => {
-      thumbnailMemory.set(artwork.id, resolved)
+      thumbnailMemory.set(cacheKey, resolved)
       if (active) setArtUrl(resolved)
     }).catch(() => {
-      thumbnailMemory.set(artwork.id, null)
+      thumbnailMemory.set(cacheKey, null)
       if (active) setArtUrl(null)
     })
     return () => {
       active = false
     }
-  }, [artwork, visible])
+  }, [artwork, cacheKey, visible])
 
   return (
-    <div ref={hostRef} className="directory-card-artwork">
+    <div ref={hostRef} className={`directory-card-artwork ${fullCardImage ? 'is-full-card-source' : ''}`}>
       {artUrl ? (
         <img
           src={artUrl}
@@ -471,14 +582,14 @@ function DirectoryCardArtwork({ card }: { card: CatalogCard }): React.JSX.Elemen
           loading="lazy"
           draggable={false}
           onError={() => {
-            if (artwork) thumbnailMemory.set(artwork.id, null)
+            thumbnailMemory.set(cacheKey, null)
             setArtUrl(null)
           }}
         />
       ) : <span aria-hidden="true">{card.kind === 'monster' ? '✧' : card.kind === 'spell' ? '◇' : '△'}</span>}
     </div>
   )
-}
+})
 
 function CatalogView(props: CatalogViewProps): React.JSX.Element {
   const { selectedCard } = props
@@ -489,24 +600,133 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
   const [sortDirection, setSortDirection] = useState<CatalogSortDirection>('asc')
   const [directoryPage, setDirectoryPage] = useState(0)
   const [directoryColumns, setDirectoryColumns] = useState(8)
+  const [virtualViewport, setVirtualViewport] = useState({ scrollTop: 0, height: 0 })
+  const [virtualRowMetrics, setVirtualRowMetrics] = useState({ pitch: 112, gap: 7 })
+  const [batchNotice, setBatchNotice] = useState<{ tone: 'success' | 'error'; text: string } | null>(null)
   const directoryGridRef = useRef<HTMLDivElement>(null)
   const directoryCardRefs = useRef(new Map<string, HTMLButtonElement>())
   const focusCardRefs = useRef(new Map<string, HTMLButtonElement>())
   const pendingDirectoryFocus = useRef<string | null>(null)
+  const virtualScrollFrame = useRef(0)
+  const paginationContextRef = useRef('')
   const sortedCards = useMemo(
     () => sortCatalogCards(props.cards, sortKey, sortDirection),
     [props.cards, sortDirection, sortKey]
   )
-  const pageCount = Math.max(1, Math.ceil(sortedCards.length / directoryPageSize))
-  const pageStart = directoryPage * directoryPageSize
-  const directoryCards = sortedCards.slice(pageStart, pageStart + directoryPageSize)
-  const selectedDirectoryIndex = selectedCard ? sortedCards.findIndex((card) => card.id === selectedCard.id) : -1
+  const directoryItems = useMemo<DirectoryCardItem[]>(() => sortedCards.flatMap((card) => {
+    const artworks = props.directoryShowArtworkVariants && card.artworks.length > 0
+      ? card.artworks
+      : [card.artworks[0]]
+    return artworks.map((artwork, index) => ({
+      id: props.directoryShowArtworkVariants && artwork ? `${card.id}::${artwork.id}` : card.id,
+      card,
+      artworkId: artwork?.id ?? '',
+      artworkLabel: artwork?.variantLabel ?? `卡圖版本 ${index + 1}`,
+      fullCardImage: artwork?.shardKey === 'ygoresources'
+    }))
+  }), [props.directoryShowArtworkVariants, sortedCards])
+  const allCardsOnOnePage = props.directoryPageRows === 'all'
+  const effectivePageSize = directoryPageSize(props.directoryPageRows, directoryColumns, directoryItems.length)
+  const pageCount = Math.max(1, Math.ceil(directoryItems.length / effectivePageSize))
+  const pageStart = directoryPage * effectivePageSize
+  const directoryCards = useMemo(
+    () => directoryItems.slice(pageStart, pageStart + effectivePageSize),
+    [directoryItems, effectivePageSize, pageStart]
+  )
+  const directoryCardIds = useMemo(() => directoryCards.map((item) => item.id), [directoryCards])
+  const virtualRange = calculateVirtualGridRange(
+    directoryCards.length,
+    directoryColumns,
+    virtualRowMetrics.pitch,
+    virtualViewport.scrollTop,
+    virtualViewport.height
+  )
+  const renderedDirectoryCards = allCardsOnOnePage
+    ? directoryCards.slice(virtualRange.startIndex, virtualRange.endIndex)
+    : directoryCards
+  const virtualTopSpace = allCardsOnOnePage && virtualRange.startRow > 0
+    ? Math.max(0, virtualRange.startRow * virtualRowMetrics.pitch - virtualRowMetrics.gap)
+    : 0
+  const virtualRemainingRows = virtualRange.totalRows - virtualRange.endRow
+  const virtualBottomSpace = allCardsOnOnePage && virtualRemainingRows > 0
+    ? Math.max(0, virtualRemainingRows * virtualRowMetrics.pitch - virtualRowMetrics.gap)
+    : 0
+  const directoryPageJump = allCardsOnOnePage
+    ? Math.max(directoryColumns, Math.floor(Math.max(virtualRowMetrics.pitch, virtualViewport.height) / virtualRowMetrics.pitch) * directoryColumns)
+    : effectivePageSize
+  const selectedDirectoryIndex = selectedCard ? directoryItems.findIndex((item) =>
+    item.card.id === selectedCard.id && (!props.directoryShowArtworkVariants || item.artworkId === props.artworkId)
+  ) : -1
+  const selectedDirectoryItemId = selectedDirectoryIndex >= 0 ? directoryItems[selectedDirectoryIndex]?.id : undefined
+  const markingBusy = props.popularityBatchBusy || props.popularityBusyId != null
+  const paginationContext = JSON.stringify([
+    layout, sortKey, sortDirection, props.directoryPageRows, directoryColumns, props.directoryShowArtworkVariants
+  ])
+  const directoryScope = useMemo(
+    () => JSON.stringify([layout, directoryPage, sortKey, sortDirection, props.query, props.directoryPageRows, directoryCardIds]),
+    [directoryCardIds, directoryPage, layout, props.directoryPageRows, props.query, sortDirection, sortKey]
+  )
+  const directoryScopeRef = useRef(directoryScope)
+  directoryScopeRef.current = directoryScope
+  const virtualHitTest: ((rect: SelectionRect) => string[]) | undefined = allCardsOnOnePage
+    ? (rect) => {
+        const grid = directoryGridRef.current
+        const tile = directoryCardRefs.current.values().next().value
+        if (!grid || !tile) return []
+        const style = window.getComputedStyle(grid)
+        const columnWidths = style.gridTemplateColumns.split(' ')
+          .map((value) => Number.parseFloat(value))
+          .filter(Number.isFinite)
+        const tileBounds = tile.getBoundingClientRect()
+        return cardsInsideVirtualGrid(rect, directoryCardIds, {
+          columns: columnWidths.length,
+          columnWidths,
+          columnGap: Number.parseFloat(style.columnGap) || 0,
+          paddingLeft: Number.parseFloat(style.paddingLeft) || 0,
+          paddingTop: Number.parseFloat(style.paddingTop) || 0,
+          rowPitch: virtualRowMetrics.pitch,
+          tileWidth: tileBounds.width,
+          tileHeight: tileBounds.height
+        })
+      }
+    : undefined
+  const directorySelection = useDirectorySelection({
+    gridRef: directoryGridRef, cardRefs: directoryCardRefs,
+    ids: directoryCardIds, scope: directoryScope,
+    focusedId: selectedDirectoryItemId, disabled: markingBusy,
+    onFocus: (itemId) => {
+      const item = directoryItems.find((candidate) => candidate.id === itemId)
+      if (item) {
+        props.onSelect(item.card.id)
+        props.onArtwork(item.artworkId)
+      }
+    },
+    hitTest: virtualHitTest
+  })
+  const selectedBatchIds = [...new Set(directoryCards
+    .filter((item) => directorySelection.selectedIds.has(item.id))
+    .map((item) => item.card.id))]
+
+  const applyDirectoryUnpopular = async (isUnpopular: boolean): Promise<void> => {
+    if (markingBusy || selectedBatchIds.length === 0) return
+    setBatchNotice(null)
+    const result = await props.onSetUnpopularBatch(selectedBatchIds, isUnpopular)
+    if (directoryScopeRef.current === directoryScope) {
+      const failedCards = new Set(result.failures.map((failure) => failure.id))
+      directorySelection.replaceSelection(directoryCards.filter((item) => failedCards.has(item.card.id)).map((item) => item.id))
+    }
+    const savedMessage = `已將 ${result.savedIds.length} 張卡片設為${isUnpopular ? '冷門' : '非冷門'}。`
+    setBatchNotice({
+      tone: result.failures.length > 0 ? 'error' : 'success',
+      text: `${savedMessage}${result.failures.length > 0 ? ` ${result.failures.length} 張未成功：${result.failures[0].message}` : ''}${window.arcana?.catalog ? '' : '（預覽模式，不會寫入本機資料庫）'}`
+    })
+  }
 
   const setLayout = (nextLayout: CatalogLayout): void => {
     setLayoutState(nextLayout)
     window.localStorage.setItem('arcana-catalog-layout', nextLayout)
     if (nextLayout === 'directory') {
-      pendingDirectoryFocus.current = selectedCard?.id ?? null
+      pendingDirectoryFocus.current = selectedDirectoryItemId ?? null
     }
   }
 
@@ -518,24 +738,41 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
   const goToDirectoryPage = (nextPage: number): void => {
     const safePage = Math.max(0, Math.min(pageCount - 1, nextPage))
     setDirectoryPage(safePage)
-    const firstCard = sortedCards[safePage * directoryPageSize]
+    const firstCard = directoryItems[safePage * effectivePageSize]
     if (firstCard) {
       pendingDirectoryFocus.current = firstCard.id
-      props.onSelect(firstCard.id)
+      props.onSelect(firstCard.card.id)
+      props.onArtwork(firstCard.artworkId)
     }
   }
 
   const focusDirectoryCard = (targetIndex: number): void => {
-    if (sortedCards.length === 0) return
-    const safeIndex = Math.max(0, Math.min(sortedCards.length - 1, targetIndex))
-    const target = sortedCards[safeIndex]
+    if (directoryItems.length === 0) return
+    const safeIndex = Math.max(0, Math.min(directoryItems.length - 1, targetIndex))
+    const target = directoryItems[safeIndex]
     if (!target) return
     pendingDirectoryFocus.current = target.id
-    setDirectoryPage(Math.floor(safeIndex / directoryPageSize))
-    props.onSelect(target.id)
+    setDirectoryPage(Math.floor(safeIndex / effectivePageSize))
+    if (allCardsOnOnePage) {
+      const grid = directoryGridRef.current
+      if (grid) {
+        const targetTop = Math.floor(safeIndex / Math.max(1, directoryColumns)) * virtualRowMetrics.pitch
+        const targetBottom = targetTop + virtualRowMetrics.pitch - virtualRowMetrics.gap
+        let nextScrollTop = grid.scrollTop
+        if (targetTop < grid.scrollTop) nextScrollTop = targetTop
+        else if (targetBottom > grid.scrollTop + grid.clientHeight) nextScrollTop = targetBottom - grid.clientHeight
+        if (nextScrollTop !== grid.scrollTop) {
+          grid.scrollTop = nextScrollTop
+          setVirtualViewport({ scrollTop: nextScrollTop, height: grid.clientHeight })
+        }
+      }
+    }
+    props.onSelect(target.card.id)
+    props.onArtwork(target.artworkId)
   }
 
   const handleDirectoryKeyDown = (event: React.KeyboardEvent<HTMLDivElement>): void => {
+    if (directorySelection.onKeyDown(event)) return
     if (event.altKey || event.ctrlKey || event.metaKey) return
     const currentIndex = selectedDirectoryIndex >= 0 ? selectedDirectoryIndex : pageStart
     let targetIndex: number | null = null
@@ -544,9 +781,9 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
     if (event.key === 'ArrowUp') targetIndex = currentIndex - directoryColumns
     if (event.key === 'ArrowDown') targetIndex = currentIndex + directoryColumns
     if (event.key === 'Home') targetIndex = event.shiftKey ? 0 : pageStart
-    if (event.key === 'End') targetIndex = event.shiftKey ? sortedCards.length - 1 : Math.min(sortedCards.length - 1, pageStart + directoryPageSize - 1)
-    if (event.key === 'PageUp') targetIndex = currentIndex - directoryPageSize
-    if (event.key === 'PageDown') targetIndex = currentIndex + directoryPageSize
+    if (event.key === 'End') targetIndex = event.shiftKey ? directoryItems.length - 1 : Math.min(directoryItems.length - 1, pageStart + effectivePageSize - 1)
+    if (event.key === 'PageUp') targetIndex = currentIndex - directoryPageJump
+    if (event.key === 'PageDown') targetIndex = currentIndex + directoryPageJump
     if (event.key === 'Enter' && selectedCard) {
       event.preventDefault()
       setLayout('focus')
@@ -558,41 +795,108 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
   }
 
   useEffect(() => {
-    if (directoryPage < pageCount) return
-    setDirectoryPage(Math.max(0, pageCount - 1))
-  }, [directoryPage, pageCount])
-
-  useEffect(() => {
-    if (selectedDirectoryIndex < 0 || layout !== 'directory') return
-    setDirectoryPage(Math.floor(selectedDirectoryIndex / directoryPageSize))
-  }, [layout, selectedDirectoryIndex, sortDirection, sortKey])
+    const contextChanged = paginationContextRef.current !== paginationContext
+    paginationContextRef.current = paginationContext
+    if (layout !== 'directory') return
+    if (contextChanged && selectedDirectoryIndex >= 0) {
+      setDirectoryPage(Math.floor(selectedDirectoryIndex / effectivePageSize))
+      pendingDirectoryFocus.current = selectedDirectoryItemId ?? null
+      if (allCardsOnOnePage) {
+        const grid = directoryGridRef.current
+        if (grid) {
+          const nextScrollTop = Math.floor(selectedDirectoryIndex / Math.max(1, directoryColumns)) * virtualRowMetrics.pitch
+          grid.scrollTop = nextScrollTop
+          setVirtualViewport({ scrollTop: nextScrollTop, height: grid.clientHeight })
+        }
+      }
+      return
+    }
+    const safePage = clampDirectoryPage(directoryPage, directoryItems.length, effectivePageSize)
+    if (safePage !== directoryPage) {
+      setDirectoryPage(safePage)
+      return
+    }
+    if (directoryItems.length === 0) return
+    const selectedOutsideCurrentPage = !isIndexOnDirectoryPage(selectedDirectoryIndex, safePage, effectivePageSize)
+    const selectedOutsideRenderedWindow = allCardsOnOnePage && (
+      selectedDirectoryIndex < virtualRange.startIndex || selectedDirectoryIndex >= virtualRange.endIndex
+    )
+    if (!selectedOutsideCurrentPage && !selectedOutsideRenderedWindow) return
+    const replacementIndex = allCardsOnOnePage
+      ? Math.min(directoryItems.length - 1, Math.floor(virtualViewport.scrollTop / virtualRowMetrics.pitch) * directoryColumns)
+      : Math.min(directoryItems.length - 1, safePage * effectivePageSize)
+    const replacement = directoryItems[replacementIndex]
+    if (replacement) {
+      pendingDirectoryFocus.current = replacement.id
+      props.onSelect(replacement.card.id)
+      props.onArtwork(replacement.artworkId)
+    }
+  }, [directoryItems, directoryPage, effectivePageSize, layout, paginationContext])
 
   useEffect(() => {
     if (layout !== 'directory') return
     const grid = directoryGridRef.current
     if (!grid) return
     const measure = (): void => {
-      const columns = window.getComputedStyle(grid).gridTemplateColumns.split(' ').filter(Boolean).length
+      const style = window.getComputedStyle(grid)
+      const columns = style.gridTemplateColumns.split(' ').filter(Boolean).length
       setDirectoryColumns(Math.max(1, columns))
+      const firstCard = directoryCardRefs.current.values().next().value
+      if (firstCard) {
+        const gap = Number.parseFloat(style.rowGap) || 0
+        const pitch = firstCard.getBoundingClientRect().height + gap
+        setVirtualRowMetrics((current) =>
+          Math.abs(current.pitch - pitch) < 0.25 && current.gap === gap ? current : { pitch, gap }
+        )
+      }
+      setVirtualViewport((current) =>
+        current.scrollTop === grid.scrollTop && current.height === grid.clientHeight
+          ? current
+          : { scrollTop: grid.scrollTop, height: grid.clientHeight }
+      )
     }
     measure()
     const observer = new ResizeObserver(measure)
     observer.observe(grid)
     return () => observer.disconnect()
-  }, [layout])
+  }, [allCardsOnOnePage, directoryCards.length, layout])
+
+  useEffect(() => () => cancelAnimationFrame(virtualScrollFrame.current), [])
+
+  useEffect(() => {
+    if (layout !== 'directory') return
+    const grid = directoryGridRef.current
+    if (!grid) return
+    const nextScrollTop = allCardsOnOnePage && selectedDirectoryIndex >= 0
+      ? Math.floor(selectedDirectoryIndex / Math.max(1, directoryColumns)) * virtualRowMetrics.pitch
+      : 0
+    grid.scrollTop = nextScrollTop
+    setVirtualViewport({ scrollTop: nextScrollTop, height: grid.clientHeight })
+    if (selectedDirectoryItemId) pendingDirectoryFocus.current = selectedDirectoryItemId
+  }, [directoryPage, layout, props.directoryPageRows, props.directoryShowArtworkVariants])
 
   useEffect(() => {
     const cardId = pendingDirectoryFocus.current
     if (!cardId || layout !== 'directory') return
     const frame = requestAnimationFrame(() => {
       const target = directoryCardRefs.current.get(cardId)
+      if (!target && allCardsOnOnePage) {
+        const cardIndex = directoryCards.findIndex((item) => item.id === cardId)
+        const grid = directoryGridRef.current
+        if (cardIndex >= 0 && grid) {
+          const nextScrollTop = Math.floor(cardIndex / Math.max(1, directoryColumns)) * virtualRowMetrics.pitch
+          grid.scrollTop = nextScrollTop
+          setVirtualViewport({ scrollTop: nextScrollTop, height: grid.clientHeight })
+        }
+        return
+      }
       if (!target) return
       target.focus()
       target.scrollIntoView({ block: 'nearest', inline: 'nearest' })
       pendingDirectoryFocus.current = null
     })
     return () => cancelAnimationFrame(frame)
-  }, [directoryPage, layout, selectedCard?.id])
+  }, [directoryPage, layout, selectedDirectoryItemId, virtualRange.endIndex, virtualRange.startIndex])
 
   useEffect(() => {
     if (layout !== 'focus' || !selectedCard) return
@@ -601,6 +905,32 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
     })
     return () => cancelAnimationFrame(frame)
   }, [layout, selectedCard?.id])
+
+  const handleDirectoryScroll = (event: React.UIEvent<HTMLDivElement>): void => {
+    if (!allCardsOnOnePage) return
+    const grid = event.currentTarget
+    cancelAnimationFrame(virtualScrollFrame.current)
+    virtualScrollFrame.current = requestAnimationFrame(() => {
+      const nextRange = calculateVirtualGridRange(
+        directoryCards.length,
+        directoryColumns,
+        virtualRowMetrics.pitch,
+        grid.scrollTop,
+        grid.clientHeight
+      )
+      const focusedElement = document.activeElement
+      if (focusedElement instanceof HTMLButtonElement && grid.contains(focusedElement)) {
+        const focusedIndex = directoryCardIds.indexOf(focusedElement.id.replace(/^directory-card-/, ''))
+        if (focusedIndex < nextRange.startIndex || focusedIndex >= nextRange.endIndex) {
+          grid.focus({ preventScroll: true })
+        }
+      }
+      setVirtualViewport((current) => {
+        const next = { scrollTop: grid.scrollTop, height: grid.clientHeight }
+        return current.scrollTop === next.scrollTop && current.height === next.height ? current : next
+      })
+    })
+  }
 
   return (
     <div className={`catalog-view catalog-mode-${layout}`}>
@@ -663,104 +993,166 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
 
       {layout === 'directory' ? (
         <section className="directory-shell" aria-label="卡片網格目錄">
-          <header className="directory-heading">
-            <div>
-              <span className="eyebrow">CARD DIRECTORY</span>
-              <h2>全卡目錄</h2>
-              <p>{catalogSortLabel(sortKey)}・{sortDirection === 'asc' ? '升冪' : '降冪'}・每頁最多 {directoryPageSize} 張</p>
-            </div>
-            <div className="directory-key-help" aria-label="鍵盤操作提示">
-              <span><kbd>←↑↓→</kbd> 選擇鄰近卡牌</span>
-              <span><kbd>Enter</kbd> 開啟詳細檢視</span>
-              <span><kbd>PgUp</kbd><kbd>PgDn</kbd> 跨頁</span>
-            </div>
-          </header>
-
-          {directoryCards.length > 0 ? (
-            <div
-              ref={directoryGridRef}
-              className="directory-card-grid"
-              role="grid"
-              aria-label={`第 ${directoryPage + 1} 頁卡片，${catalogSortLabel(sortKey)}`}
-              onKeyDown={handleDirectoryKeyDown}
-            >
-              {directoryCards.map((card, pageIndex) => {
-                const absoluteIndex = pageStart + pageIndex
-                const isSelected = selectedCard?.id === card.id
-                return (
-                  <button
-                    ref={(node) => {
-                      if (node) directoryCardRefs.current.set(card.id, node)
-                      else directoryCardRefs.current.delete(card.id)
-                    }}
-                    type="button"
-                    role="gridcell"
-                    key={card.id}
-                    id={`directory-card-${card.id}`}
-                    className={`directory-card-tile ${isSelected ? 'is-selected' : ''} ${card.isUnpopular ? 'is-unpopular' : ''}`}
-                    style={{ '--card-accent': card.accent } as React.CSSProperties}
-                    tabIndex={isSelected || (selectedDirectoryIndex < 0 && pageIndex === 0) ? 0 : -1}
-                    aria-selected={isSelected}
-                    aria-label={`${card.nameZh}，${cardProgressionLabel(card)}，${card.kind === 'monster' ? `攻擊力 ${card.atk ?? '未知'}，守備力 ${card.def ?? '未知'}` : card.typeLine}`}
-                    onClick={() => props.onSelect(card.id)}
-                    onDoubleClick={() => setLayout('focus')}
+          <div className="directory-browser">
+            <header className="directory-heading">
+              <div>
+                <span className="eyebrow">CARD DIRECTORY</span>
+                <h2>全卡目錄</h2>
+                <p>{catalogSortLabel(sortKey)}・{sortDirection === 'asc' ? '升冪' : '降冪'}・{allCardsOnOnePage ? '全部卡片單頁（虛擬化）' : `每頁最多 ${props.directoryPageRows} 列`}{props.directoryShowArtworkVariants ? `・${directoryItems.length} 個卡圖版本` : ''}</p>
+              </div>
+              <div className="directory-view-settings" aria-label="網格顯示設定">
+                <label className="directory-row-setting">
+                  <span>每頁列數</span>
+                  <select
+                    aria-label="網格目錄每頁列數"
+                    value={props.directoryPageRows}
+                    onChange={(event) => props.onDirectoryPageRows(sanitizeDirectoryPageRows(event.target.value))}
                   >
-                    <span className="directory-index">{String(absoluteIndex + 1).padStart(4, '0')}</span>
-                    <span className={`directory-card-face frame-${card.frame} ${card.pendulumScaleLeft != null ? 'is-pendulum' : ''}`}>
-                      <DirectoryCardArtwork card={card} />
-                      <span className="directory-card-title">{card.nameZh}</span>
-                      <span className="directory-card-level">{cardProgressionLabel(card)}</span>
-                    </span>
-                    <span className="directory-card-caption">
-                      <strong>{card.nameZh}</strong>
-                      <small>{card.kind === 'monster' ? `ATK ${card.atk ?? '—'} / DEF ${card.def ?? '—'}` : card.typeLine}</small>
-                    </span>
-                    {card.isUnpopular && <span className="directory-unpopular-badge">冷門</span>}
-                  </button>
-                )
-              })}
-            </div>
-          ) : (
-            <div className="empty-state directory-empty-state"><span>⌕</span><strong>沒有符合條件的卡片</strong><p>試著移除效果標籤或使用較短的關鍵字。</p></div>
-          )}
+                    {directoryPageRowOptions.map((rows) => (
+                      <option key={rows} value={rows}>{rows === 'all' ? '全部擠在同一頁' : `${rows} 列`}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="directory-variant-setting">
+                  <input
+                    type="checkbox"
+                    checked={props.directoryShowArtworkVariants}
+                    onChange={(event) => props.onDirectoryShowArtworkVariants(event.target.checked)}
+                  />
+                  <span>顯示不同卡圖版本</span>
+                </label>
+              </div>
+              <div className="directory-key-help" aria-label="鍵盤操作提示">
+                <span><kbd>←↑↓→</kbd> 選擇鄰近卡牌</span>
+                <span><kbd>Enter</kbd> 開啟詳細檢視</span>
+                <span><kbd>PgUp</kbd><kbd>PgDn</kbd> {allCardsOnOnePage ? '捲動一屏' : '跨頁'}</span>
+              </div>
+              <div className="directory-batch-toolbar" role="group" aria-label="批次設定冷門標記">
+                <span className="directory-selection-count" role="status">{props.popularityBatchBusy ? '正在設定…' : <>已選 <strong>{selectedBatchIds.length}</strong> 張</>}</span>
+                <button type="button" disabled={markingBusy || directoryCards.length === 0} onClick={() => directorySelection.replaceSelection(directoryCards.map((item) => item.id))}>本頁全選</button>
+                <button type="button" disabled={markingBusy || selectedBatchIds.length === 0} onClick={() => directorySelection.replaceSelection([])}>清除選取</button>
+                <button type="button" className="directory-mark-unpopular" disabled={markingBusy || selectedBatchIds.length === 0} onClick={() => { void applyDirectoryUnpopular(true) }}>
+                  設為冷門卡片
+                </button>
+                <button type="button" disabled={markingBusy || selectedBatchIds.length === 0} onClick={() => { void applyDirectoryUnpopular(false) }}>
+                  設為非冷門卡片
+                </button>
+                <p id="directory-selection-help">拖曳框選本頁卡片；Ctrl／⌘ 點選加減、Shift 連選、Esc 清除。</p>
+              </div>
+              {batchNotice && <p className={`directory-batch-notice tone-${batchNotice.tone}`} role="status">{batchNotice.text}</p>}
+            </header>
 
-          <footer className="directory-footer">
-            <div className="directory-pagination" aria-label="目錄分頁">
-              <button type="button" onClick={() => goToDirectoryPage(0)} disabled={directoryPage === 0}>«</button>
-              <button type="button" onClick={() => goToDirectoryPage(directoryPage - 1)} disabled={directoryPage === 0}>‹ 上一頁</button>
-              <span>第 <strong>{directoryPage + 1}</strong> / {pageCount} 頁</span>
-              <button type="button" onClick={() => goToDirectoryPage(directoryPage + 1)} disabled={directoryPage >= pageCount - 1}>下一頁 ›</button>
-              <button type="button" onClick={() => goToDirectoryPage(pageCount - 1)} disabled={directoryPage >= pageCount - 1}>»</button>
-            </div>
-            <span className="directory-range">
-              {sortedCards.length > 0 ? `${pageStart + 1}–${Math.min(pageStart + directoryPageSize, sortedCards.length)} / ${sortedCards.length}` : '0 / 0'}
-            </span>
-          </footer>
+            {directoryCards.length > 0 ? (
+              <div
+                ref={directoryGridRef}
+                className={`directory-card-grid ${allCardsOnOnePage ? 'is-virtualized' : ''} ${directorySelection.marquee ? 'is-box-selecting' : ''}`}
+                role="grid"
+                tabIndex={-1}
+                aria-multiselectable="true"
+                aria-describedby="directory-selection-help"
+                aria-busy={props.popularityBatchBusy}
+                aria-label={`${allCardsOnOnePage ? '全部' : `第 ${directoryPage + 1} 頁`}卡片，${catalogSortLabel(sortKey)}`}
+                onKeyDown={handleDirectoryKeyDown}
+                onScroll={handleDirectoryScroll}
+                onPointerDown={directorySelection.onPointerDown}
+                onClickCapture={directorySelection.onClickCapture}
+                onClick={directorySelection.onBackgroundClick}
+                onDragStart={(event) => event.preventDefault()}
+              >
+                {virtualTopSpace > 0 && <div className="directory-virtual-spacer" style={{ height: virtualTopSpace }} aria-hidden="true" />}
+                {renderedDirectoryCards.map((item, renderedIndex) => {
+                  const card = item.card
+                  const pageIndex = allCardsOnOnePage ? virtualRange.startIndex + renderedIndex : renderedIndex
+                  const isSelected = selectedDirectoryItemId === item.id
+                  const isBatchSelected = directorySelection.selectedIds.has(item.id)
+                  return (
+                    <button
+                      ref={(node) => {
+                        if (node) directoryCardRefs.current.set(item.id, node)
+                        else directoryCardRefs.current.delete(item.id)
+                      }}
+                      type="button"
+                      role="gridcell"
+                      key={item.id}
+                      id={`directory-card-${item.id}`}
+                      className={`directory-card-tile ${isSelected ? 'is-selected' : ''} ${isBatchSelected ? 'is-batch-selected' : ''} ${card.isUnpopular ? 'is-unpopular' : ''}`}
+                      style={{ '--card-accent': card.accent } as React.CSSProperties}
+                      tabIndex={isSelected || (selectedDirectoryIndex < 0 && pageIndex === 0) ? 0 : -1}
+                      aria-selected={isBatchSelected}
+                      aria-label={`${card.nameZh}，${item.artworkLabel}，${cardProgressionLabel(card)}，${card.kind === 'monster' ? `攻擊力 ${card.atk ?? '未知'}，守備力 ${card.def ?? '未知'}` : card.typeLine}`}
+                      title={props.directoryShowArtworkVariants ? `${card.nameZh}・${item.artworkLabel}` : card.nameZh}
+                      onClick={(event) => directorySelection.onCardClick(event, item.id)}
+                      onDoubleClick={(event) => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey) setLayout('focus') }}
+                    >
+                      <span className={`directory-card-face frame-${card.frame} ${card.pendulumScaleLeft != null ? 'is-pendulum' : ''}`}>
+                        <DirectoryCardArtwork card={card} artworkId={item.artworkId} fullCardImage={item.fullCardImage} />
+                        <span className="directory-card-title">{card.nameZh}</span>
+                      </span>
+                      {props.directoryShowArtworkVariants && <span className="directory-artwork-version">{item.artworkLabel}</span>}
+                      {isBatchSelected && <span className="directory-multiselect-check" aria-hidden="true">✓</span>}
+                      {card.isUnpopular && <span className="directory-unpopular-badge">冷門</span>}
+                    </button>
+                  )
+                })}
+                {virtualBottomSpace > 0 && <div className="directory-virtual-spacer" style={{ height: virtualBottomSpace }} aria-hidden="true" />}
+                {directorySelection.marquee && <div className="directory-selection-marquee" style={directorySelection.marquee} aria-hidden="true" />}
+              </div>
+            ) : (
+              <div className="empty-state directory-empty-state"><span>⌕</span><strong>沒有符合條件的卡片</strong><p>試著移除效果標籤或使用較短的關鍵字。</p></div>
+            )}
 
-          {selectedCard && selectedDirectoryIndex >= 0 && (
-            <aside className="directory-selection-dock" aria-live="polite">
-              <div className="directory-selection-identity">
-                <span className={`selection-kind-mark frame-${selectedCard.frame}`} aria-hidden="true">
-                  {selectedCard.kind === 'monster' ? '✧' : selectedCard.kind === 'spell' ? '◇' : '△'}
-                </span>
-                <div>
-                  <small>SELECTED CARD</small>
-                  <strong>{selectedCard.nameZh}</strong>
-                  <span>{selectedCard.nameJa || selectedCard.nameEn || selectedCard.typeLine}</span>
+            <footer className="directory-footer">
+              {allCardsOnOnePage ? (
+                <div className="directory-single-page">全部卡片・單頁模式</div>
+              ) : (
+                <div className="directory-pagination" aria-label="目錄分頁">
+                  <button type="button" onClick={() => goToDirectoryPage(0)} disabled={directoryPage === 0}>«</button>
+                  <button type="button" onClick={() => goToDirectoryPage(directoryPage - 1)} disabled={directoryPage === 0}>‹ 上一頁</button>
+                  <span>第 <strong>{directoryPage + 1}</strong> / {pageCount} 頁</span>
+                  <button type="button" onClick={() => goToDirectoryPage(directoryPage + 1)} disabled={directoryPage >= pageCount - 1}>下一頁 ›</button>
+                  <button type="button" onClick={() => goToDirectoryPage(pageCount - 1)} disabled={directoryPage >= pageCount - 1}>»</button>
                 </div>
-              </div>
-              <div className="directory-selection-stats">
-                <span><small>類型</small><strong>{selectedCard.typeLine}</strong></span>
-                <span><small>等級資訊</small><strong>{cardProgressionLabel(selectedCard)}</strong></span>
-                <span><small>ATK / DEF</small><strong>{selectedCard.kind === 'monster' ? `${selectedCard.atk ?? '—'} / ${selectedCard.def ?? '—'}` : '—'}</strong></span>
-                <span><small>首次發行</small><strong>{cardReleaseDate(selectedCard) ?? '資料未提供'}</strong></span>
-              </div>
-              <div className="directory-selection-actions">
-                <button type="button" className="directory-detail-button" onClick={() => setLayout('focus')}>查看卡片 <Glyph>↗</Glyph></button>
-                <button type="button" className="directory-studio-button" onClick={props.onOpenStudio}>藝術加工室</button>
-              </div>
-            </aside>
-          )}
+              )}
+              <span className="directory-range">
+                {directoryItems.length > 0 ? `${pageStart + 1}–${Math.min(pageStart + effectivePageSize, directoryItems.length)} / ${directoryItems.length}` : '0 / 0'}
+              </span>
+            </footer>
+          </div>
+
+          <aside className="directory-preview" aria-label="所選卡片大圖與效果文字">
+            {selectedCard && selectedDirectoryIndex >= 0 ? (
+              <>
+                <div className="directory-preview-card">
+                  <CardPreview
+                    key={selectedCard.id}
+                    card={selectedCard}
+                    artworkId={selectedCard.artworks.find((art) => art.id === props.artworkId)?.id ?? selectedCard.artworks[0]?.id ?? ''}
+                    ruleText={props.activeRuleText}
+                    finish={{ surface: 'none', scope: 'whole', rim: 'none', name: 'ink', stamp: false }}
+                    featured
+                    interactive={false}
+                    embellishments={false}
+                    textMode="fit"
+                  />
+                </div>
+                <details className="directory-effects">
+                  <summary><span>效果文字</span><span className="directory-effects-hint" aria-hidden="true" /></summary>
+                  <div className="directory-effect-copy">
+                    {selectedCard.pendulumText && (
+                      <section>
+                        <h3>鐘擺效果</h3>
+                        <p>{selectedCard.pendulumText}</p>
+                      </section>
+                    )}
+                    <section>
+                      {selectedCard.pendulumText && <h3>怪獸效果</h3>}
+                      <p>{props.activeRuleText || '尚無效果文字。'}</p>
+                    </section>
+                  </div>
+                </details>
+              </>
+            ) : <div className="directory-preview-empty">選擇卡片以檢視大圖</div>}
+          </aside>
         </section>
       ) : <div className="catalog-content">
         <section className="catalog-grid-panel">
@@ -923,7 +1315,7 @@ function CatalogView(props: CatalogViewProps): React.JSX.Element {
             <button
               type="button"
               className={`popularity-toggle ${selectedCard.isUnpopular ? 'is-active' : ''}`}
-              disabled={props.popularityBusyId === selectedCard.id}
+              disabled={props.popularityBusyId != null || props.popularityBatchBusy}
               onClick={() => props.onToggleUnpopular(selectedCard)}
             >
               <Glyph>{selectedCard.isUnpopular ? '◉' : '○'}</Glyph>
@@ -956,7 +1348,7 @@ const describeUpdateResult = (result: CatalogUpdateResult): string => {
   ].filter(Boolean).join('、')
   if (result.mode === 'month') {
     const suffix = result.missingRequiredLanguages > 0
-      ? `；${result.missingRequiredLanguages} 張因必要語系不完整而未匯入（${languageGaps}）`
+      ? `；${result.missingRequiredLanguages} 張已另存缺漏清單（${languageGaps}），不影響其他卡片更新`
       : ''
     return `${scope} 單月更新完成：${counts}${suffix}。`
   }
@@ -968,9 +1360,7 @@ const describeUpdateResult = (result: CatalogUpdateResult): string => {
       ? '已達 YGOPRODeck 本次請求上限'
       : result.stoppedBy === 'chinese-card-limit'
         ? '已達百鴿中文來源本次流量上限'
-        : result.stoppedBy === 'waiting-language'
-          ? `遇到必要語系不完整的卡片${result.missingRequiredLanguages > 0 ? `（${languageGaps}）` : ''}`
-          : '已依來源規則停止'
+        : '已依來源規則停止'
     return `${counts}；${stopReason}。${coverage}${result.resumeMonth ? `，下次由 ${result.resumeMonth} 接續` : ''}。`
   }
   return `${counts}；${coverage}。`
@@ -979,6 +1369,8 @@ const describeUpdateResult = (result: CatalogUpdateResult): string => {
 const emptyCoverage = (region: ReleaseRegion): CatalogCoverage => ({
   region,
   completeThrough: null,
+  scannedThrough: null,
+  pendingCards: 0,
   resumeMonth: null,
   resumeOffset: 0,
   targetMonth: null,
@@ -989,14 +1381,15 @@ const emptyCoverage = (region: ReleaseRegion): CatalogCoverage => ({
 const coverageSummary = (coverage?: CatalogCoverage[]): string => {
   const ocg = coverage?.find((item) => item.region === 'ocg')
   const tcg = coverage?.find((item) => item.region === 'tcg')
-  if (!ocg?.completeThrough && !tcg?.completeThrough) return '尚未建立連續發行時間涵蓋範圍'
-  return `OCG ${ocg?.completeThrough ?? '未開始'}・TCG ${tcg?.completeThrough ?? '未開始'}`
+  if (!ocg?.scannedThrough && !tcg?.scannedThrough) return '尚未建立發行月份掃描進度'
+  return `已掃描 OCG ${ocg?.scannedThrough ?? '未開始'}・TCG ${tcg?.scannedThrough ?? '未開始'}；待補 ${(ocg?.pendingCards ?? 0) + (tcg?.pendingCards ?? 0)} 張`
 }
 
 const coverageStatusText = (coverage: CatalogCoverage): string => {
   if (coverage.status === 'complete') return '已達指定目標'
+  if (coverage.status === 'complete-with-gaps') return '掃描完成・仍有待補資料'
   if (coverage.status === 'source-limit') return '已到本次流量上限'
-  if (coverage.status === 'waiting-language') return '等待必要語系'
+  if (coverage.status === 'waiting-language') return '舊進度待接續，缺漏將另存清單'
   return '尚未開始'
 }
 
@@ -1004,6 +1397,9 @@ function UpdateCenterView({
   stats,
   policies,
   busy,
+  state,
+  commandBusy,
+  onControl,
   notice,
   onUpdate,
   onCatalog
@@ -1011,6 +1407,9 @@ function UpdateCenterView({
   stats: CatalogStats | null
   policies: CatalogSourcePolicy[]
   busy: boolean
+  state: CatalogUpdateState | null
+  commandBusy: boolean
+  onControl: (control: CatalogUpdateControl) => Promise<void>
   notice: { tone: 'success' | 'error' | 'info'; text: string } | null
   onUpdate: (request: CatalogUpdateRequest) => Promise<void>
   onCatalog: () => void
@@ -1019,9 +1418,17 @@ function UpdateCenterView({
   const [year, setYear] = useState(today.getFullYear())
   const [month, setMonth] = useState(today.getMonth() + 1)
   const [region, setRegion] = useState<ReleaseRegion>('ocg')
-  const [mode, setMode] = useState<CatalogUpdateMode>('month')
+  const [mode, setMode] = useState<Exclude<CatalogUpdateMode, 'repair'>>('month')
+  useEffect(() => {
+    if (!state?.request) return
+    setYear(state.request.year)
+    setMonth(state.request.month)
+    setRegion(state.request.region)
+    setMode(state.request.mode === 'repair' ? 'through' : state.request.mode)
+  }, [state?.request?.year, state?.request?.month, state?.request?.region, state?.request?.mode])
   const years = Array.from({ length: today.getFullYear() + 2 - 1999 }, (_, index) => today.getFullYear() + 1 - index)
-  const coverage = stats?.coverage ?? [emptyCoverage('ocg'), emptyCoverage('tcg')]
+  const coverage = (stats?.coverage ?? [emptyCoverage('ocg'), emptyCoverage('tcg')]).map((item) =>
+    state?.progress?.coverage.region === item.region && ['running', 'cooling', 'pausing', 'cancelling'].includes(state.status) ? state.progress.coverage : item)
   const activeCoverage = coverage.find((item) => item.region === region) ?? emptyCoverage(region)
 
   return (
@@ -1031,14 +1438,15 @@ function UpdateCenterView({
           <button type="button" className="back-button" onClick={onCatalog}>← 返回卡片圖鑑</button>
           <span className="eyebrow">RELEASE DATA COVERAGE</span>
           <h2>可續傳的多語卡片資料更新</h2>
-          <p>中文、英文、日文名稱會依 OCG／TCG 發行區域檢查完整性：跨區發行必須三語齊全，區域限定卡只要求中文及該區語系；程式不會把執行更新的時間誤當成卡片發行涵蓋時間。</p>
+          <p>儘可能匯入可用卡片；必要語系缺漏會保存到下方清單，繼續處理後面的卡片，不會因此暫停。OCG 要求中文卡名與效果文；TCG 另要求英文，跨區卡另需日文。已掃描進度與完整涵蓋範圍分開顯示。</p>
         </div>
         <div className="coverage-grid">
           {coverage.map((item) => (
             <article key={item.region} className={item.region === region ? 'is-active' : ''}>
               <span>{item.region.toUpperCase()}</span>
-              <strong>{item.completeThrough ?? '尚未開始'}</strong>
-              <small>完整涵蓋至此發行日</small>
+              <strong>{item.scannedThrough ?? '尚未開始'}</strong>
+              <small>已掃描至此發行日（可能有待補資料）</small>
+              <p>完整涵蓋：{item.completeThrough ?? '尚未建立'}・待補 {item.pendingCards} 張</p>
               <em>{coverageStatusText(item)}</em>
               {item.resumeMonth && <p>續傳：{item.resumeMonth}{item.resumeOffset ? `，月內第 ${item.resumeOffset + 1} 張` : ''}</p>}
               {item.note && <p className="coverage-note">{item.note}</p>}
@@ -1052,13 +1460,13 @@ function UpdateCenterView({
           <span className="eyebrow">UPDATE SCOPE</span>
           <h3>選擇更新範圍</h3>
           <div className="update-mode-switch" role="group" aria-label="更新方式">
-            <button type="button" className={mode === 'month' ? 'is-active' : ''} onClick={() => setMode('month')}>指定單一月份</button>
-            <button type="button" className={mode === 'through' ? 'is-active' : ''} onClick={() => setMode('through')}>截至指定年月的全部卡片</button>
+            <button type="button" disabled={busy} className={mode === 'month' ? 'is-active' : ''} onClick={() => setMode('month')}>指定單一月份</button>
+            <button type="button" disabled={busy} className={mode === 'through' ? 'is-active' : ''} onClick={() => setMode('through')}>截至指定年月的全部卡片</button>
           </div>
           <p className="update-mode-note">
             {mode === 'month'
-              ? '只更新所選發行月份，不改變「已完整涵蓋至」的連續進度。'
-              : `從 ${activeCoverage.resumeMonth ?? (activeCoverage.completeThrough ? '下一個未完成月份' : region === 'ocg' ? '1999-01' : '2002-01')} 接續，直到目標月份或本次來源上限。`}
+              ? '只更新所選月份，不推進連續掃描游標；若補齊既有缺漏，完整涵蓋範圍會同步更新。'
+              : `從 ${activeCoverage.resumeMonth ?? (activeCoverage.scannedThrough ? '下一個未掃描月份' : region === 'ocg' ? '1999-01' : '2002-01')} 接續；缺漏另存清單，每批達上限後冷卻 30 秒並自動繼續。`}
           </p>
           <form
             className="update-center-form"
@@ -1089,10 +1497,13 @@ function UpdateCenterView({
               </select>
             </label>
             <button type="submit" disabled={busy}>
-              {busy ? '正在依來源規則更新…' : mode === 'through' ? `更新至 ${year} 年 ${month} 月` : `更新 ${year} 年 ${month} 月`}
+              {busy ? state && ['paused', 'blocked'].includes(state.status) ? '作業已暫停，請繼續或取消' : '更新作業已啟動…' : mode === 'through' ? `自動更新至 ${year} 年 ${month} 月` : `更新 ${year} 年 ${month} 月`}
             </button>
           </form>
+          {state?.request && <UpdateProgressPanel state={state} commandBusy={commandBusy} onControl={onControl} />}
           {notice && <div className={`update-notice tone-${notice.tone}`} role={notice.tone === 'error' ? 'alert' : 'status'}>{notice.text}</div>}
+          <PendingCardsPanel region={region} year={year} month={month} busy={busy}
+            refreshKey={`${state?.status}-${state?.batchNumber}-${activeCoverage.pendingCards}-${state?.deferred}`} onUpdate={onUpdate} />
         </section>
 
         <aside className="source-policy-panel">
@@ -1113,10 +1524,102 @@ function UpdateCenterView({
               </article>
             ))}
           </div>
-          <p className="source-policy-foot">卡圖不在更新期間批次下載；仍只在查看時抓取一次並存入本機媒體分片。</p>
+          <p className="source-policy-foot">以上為本程式採用的保守流量上限。每輪達上限後至少冷卻 30 秒；單一背景作業會保留各來源的請求間隔。卡圖仍只在查看時下載並快取。</p>
         </aside>
       </div>
     </div>
+  )
+}
+
+const missingFieldLabels: Record<CatalogMissingField, string> = {
+  nameZh: '中文卡名', ruleTextZh: '中文效果文', nameEn: '英文卡名', nameJa: '日文卡名'
+}
+
+function PendingCardsPanel({ region, year, month, busy, refreshKey, onUpdate }: {
+  region: ReleaseRegion; year: number; month: number; busy: boolean; refreshKey: string
+  onUpdate: (request: CatalogUpdateRequest) => Promise<void>
+}): React.JSX.Element {
+  const [page, setPage] = useState(0)
+  const [pending, setPending] = useState<CatalogPendingPage>({ total: 0, items: [] })
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => { setPage(0) }, [region])
+  useEffect(() => {
+    const api = window.arcana?.catalog
+    if (!api) return
+    let mounted = true
+    void api.pendingCards(region, page).then((result) => {
+      if (!mounted) return
+      setPending(result)
+      setError(null)
+      if (page > 0 && page * 50 >= result.total) setPage(Math.max(0, Math.ceil(result.total / 50) - 1))
+    }).catch(() => { if (mounted) setError('無法讀取缺漏清單，請重新開啟更新中心。') })
+    return () => { mounted = false }
+  }, [region, page, refreshKey])
+  return <section className="pending-cards-panel" aria-label="待補資料清單">
+    <header><div><h3>待補資料清單</h3><p>{region.toUpperCase()} 共 {pending.total} 張・已保存於本機，關閉程式仍保留</p></div></header>
+    <p>正常更新不會重試已掃描的缺口。需要補齊時，可只重試所選地區截至 {year} 年 {month} 月的缺漏卡片；每張本輪只試一次，仍缺資料的會留待日後。</p>
+    <button type="button" disabled={busy || pending.total === 0 || error != null}
+      onClick={() => { void onUpdate({ mode: 'repair', region, year, month }) }}>只重試缺漏卡片</button>
+    {error ? <p role="alert">{error}</p> : pending.total === 0 ? <p>目前沒有待補的語系缺漏。</p> : <>
+      <div className="pending-cards-table"><table><thead><tr><th>卡片／發行月份</th><th>缺漏內容</th><th>檢查記錄</th></tr></thead><tbody>
+        {pending.items.map((card) => <tr key={card.passcode}>
+          <td><a href={card.sourceUrl} target="_blank" rel="noreferrer">{card.name}</a><small>{card.passcode}・{card.releaseMonth}</small></td>
+          <td>{card.missingFields.map((field) => missingFieldLabels[field]).join('、')}<small>{card.reason}</small></td>
+          <td>{card.attempts} 次<small>最近：{new Date(card.lastCheckedAt).toLocaleString('zh-TW')}</small><small>首次：{new Date(card.firstSeenAt).toLocaleDateString('zh-TW')}</small></td>
+        </tr>)}
+      </tbody></table></div>
+      <div className="pending-pagination"><button type="button" disabled={page === 0} onClick={() => setPage(page - 1)}>上一頁</button>
+        <span>第 {page + 1}／{Math.max(1, Math.ceil(pending.total / 50))} 頁</span>
+        <button type="button" disabled={(page + 1) * 50 >= pending.total} onClick={() => setPage(page + 1)}>下一頁</button></div>
+    </>}
+  </section>
+}
+
+function UpdateProgressPanel({ state, commandBusy, onControl }: {
+  state: CatalogUpdateState
+  commandBusy: boolean
+  onControl: (control: CatalogUpdateControl) => Promise<void>
+}): React.JSX.Element {
+  const [now, setNow] = useState(Date.now())
+  useEffect(() => {
+    setNow(Date.now())
+    if (state.status !== 'cooling') return
+    const timer = window.setInterval(() => setNow(Date.now()), 500)
+    return () => window.clearInterval(timer)
+  }, [state.status, state.nextBatchAt])
+  const progress = state.progress
+  const percent = progress?.percent ?? 0
+  const waiting = state.status === 'cooling'
+  const paused = state.status === 'paused' || state.status === 'blocked'
+  const stopping = state.status === 'pausing' || state.status === 'cancelling'
+  const active = state.status === 'running' || waiting
+  const seconds = Math.max(0, Math.ceil(((state.nextBatchAt ?? now) - now) / 1000))
+  const labels: Record<CatalogUpdateState['status'], string> = {
+    idle: '尚未開始', running: '更新中', cooling: '安全冷卻中', pausing: '正在暫停',
+    paused: '已暫停', cancelling: '正在取消', cancelled: '已取消', completed: '作業結束', blocked: '需要處理・已暫停'
+  }
+  return (
+    <section className={`update-progress-panel status-${state.status}`} aria-label="更新作業進度">
+      <header>
+        <div><strong>{labels[state.status]}{state.request?.mode === 'repair' ? '・缺漏補查' : ''}</strong><span>{state.request?.region.toUpperCase()}・{state.request?.year}-{String(state.request?.month).padStart(2, '0')}・第 {state.batchNumber} 批</span></div>
+        <b>{percent >= 100 ? '100' : (Math.floor(percent * 10) / 10).toFixed(1)}%</b>
+      </header>
+      <progress max={100} value={percent} aria-label={state.request?.mode === 'repair' ? '本輪缺漏補查進度' : '發行月份掃描進度'} />
+      {progress && <p className="update-progress-detail">
+        {state.request?.mode === 'through' && `已掃描 ${progress.completedMonths}／${progress.totalMonths} 個發行月份（含先前進度）；`}
+        {state.request?.mode === 'repair' ? '本輪補查' : progress.currentMonth}：{progress.monthTotal == null ? '讀取月份清單' : `${state.request?.mode === 'repair' ? '' : '月內 '}${progress.monthProcessed}／${progress.monthTotal} 張`}
+      </p>}
+      <div className="update-progress-counts"><span>本作業已檢查 <strong>{state.fetched}</strong> 張</span><span>新增 <strong>{state.inserted}</strong> 張</span><span>更新 <strong>{state.updated}</strong> 張</span><span>另存待補 <strong>{state.deferred}</strong> 張</span></div>
+      <p role="status">{state.message}</p>
+      {waiting && <p className="update-countdown">{seconds > 0 ? `${seconds} 秒後自動接續` : '即將自動接續…'}・不需再次按更新</p>}
+      {state.lastResult?.mode === 'month' && state.status === 'completed' && <p>{describeUpdateResult(state.lastResult)}</p>}
+      <div className="update-progress-actions">
+        {active && <button type="button" disabled={commandBusy} onClick={() => { void onControl('pause') }}>暫停更新</button>}
+        {paused && <button type="button" disabled={commandBusy} onClick={() => { void onControl('resume') }}>繼續更新</button>}
+        {(active || paused || stopping) && <button type="button" className="cancel-update" disabled={commandBusy || state.status === 'cancelling'} onClick={() => { void onControl('cancel') }}>取消作業</button>}
+      </div>
+      <small>{state.request?.mode === 'repair' ? '補查進度以本輪開始時的缺漏清單計算，每張只試一次。' : '進度條代表已掃描的月份及月內位置，100% 不代表沒有缺漏；缺漏另存清單。'}切換頁面不會中斷作業；關閉程式會停止，已保存進度與缺漏清單會保留。</small>
+    </section>
   )
 }
 

@@ -107,15 +107,17 @@ export function CardPreview({
   embellishments = true,
   textMode = 'fit'
 }: CardPreviewProps): React.JSX.Element {
-  const [artUrl, setArtUrl] = useState<string | null>(artworkMemory.get(artworkId) ?? null)
-  const [loading, setLoading] = useState(!artworkMemory.has(artworkId))
+  const artwork = card.artworks.find((item) => item.id === artworkId) ?? card.artworks[0]
+  const artworkCacheKey = artwork ? `${artwork.id}::${artwork.sourceUrl ?? ''}` : artworkId
+  const [artUrl, setArtUrl] = useState<string | null>(artworkMemory.get(artworkCacheKey) ?? null)
+  const [loading, setLoading] = useState(!artworkMemory.has(artworkCacheKey))
   const stageRef = useRef<HTMLDivElement>(null)
   const titleRef = useRef<HTMLHeadingElement>(null)
   const textBoxRef = useRef<HTMLElement>(null)
   const ruleRef = useRef<HTMLParagraphElement>(null)
   const pendulumBoxRef = useRef<HTMLElement>(null)
   const pendulumRuleRef = useRef<HTMLParagraphElement>(null)
-  const artwork = card.artworks.find((item) => item.id === artworkId) ?? card.artworks[0]
+  const isFullCardSource = artwork?.shardKey === 'ygoresources'
   const isPendulum = card.pendulumScaleLeft != null || card.pendulumScaleRight != null
   const ruleSegments = useMemo(() => splitRuleText(ruleText, card.frame), [card.frame, ruleText])
 
@@ -126,17 +128,18 @@ export function CardPreview({
       setLoading(false)
       return
     }
-    const remembered = artworkMemory.get(artwork.id)
+    const remembered = artworkMemory.get(artworkCacheKey)
     if (remembered !== undefined) {
       setArtUrl(remembered)
       setLoading(false)
       return
     }
+    setArtUrl(null)
     setLoading(true)
     const resolver = window.arcana?.catalog.resolveArtwork ?? (() => Promise.resolve(artwork.sourceUrl))
     resolver(artwork.id)
       .then((resolved) => {
-        artworkMemory.set(artwork.id, resolved)
+        artworkMemory.set(artworkCacheKey, resolved)
         if (active) setArtUrl(resolved)
       })
       .finally(() => {
@@ -145,7 +148,7 @@ export function CardPreview({
     return () => {
       active = false
     }
-  }, [artwork])
+  }, [artwork, artworkCacheKey])
 
   const levelMarks = useMemo(() => {
     if (!card.level) return []
@@ -178,7 +181,7 @@ export function CardPreview({
       cancelAnimationFrame(frame)
       observer.disconnect()
     }
-  }, [card.nameZh])
+  }, [card.nameZh, isFullCardSource])
 
   useLayoutEffect(() => {
     const box = textBoxRef.current
@@ -206,7 +209,7 @@ export function CardPreview({
       cancelAnimationFrame(frame)
       observer.disconnect()
     }
-  }, [card.frame, card.kind, compact, featured, ruleText, textMode])
+  }, [card.frame, card.kind, compact, featured, isFullCardSource, ruleText, textMode])
 
   useLayoutEffect(() => {
     const box = pendulumBoxRef.current
@@ -234,7 +237,7 @@ export function CardPreview({
       cancelAnimationFrame(frame)
       observer.disconnect()
     }
-  }, [card.pendulumText, compact, featured, textMode])
+  }, [card.pendulumText, compact, featured, isFullCardSource, textMode])
 
   const onPointerMove = (event: PointerEvent<HTMLDivElement>): void => {
     if (!interactive || !stageRef.current) return
@@ -298,13 +301,16 @@ export function CardPreview({
           </div>
         )}
 
-        <div className={`rendered-card-art ${loading ? 'is-loading' : ''}`}>
+        <div className={`rendered-card-art ${loading ? 'is-loading' : ''} ${isFullCardSource ? 'is-full-card-source' : ''}`}>
           {artUrl ? (
             <img
               src={artUrl}
               alt={`${card.nameZh}－${artwork?.variantLabel ?? '卡圖'}`}
               draggable={false}
-              onError={() => setArtUrl(null)}
+              onError={() => {
+                artworkMemory.set(artworkCacheKey, null)
+                setArtUrl(null)
+              }}
             />
           ) : (
             <div className="art-fallback" aria-hidden="true">
